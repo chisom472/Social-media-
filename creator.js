@@ -1,80 +1,101 @@
-/* Creator studio: overview, content, audience, earnings, fees, ads and shortcuts */
-(function () {
-  const { esc } = DE;
-  const TABS = [['', 'Overview'], ['content', 'Content'], ['audience', 'Audience'], ['earnings', 'Earnings'], ['fees', 'Fees'], ['ads', 'Ads']];
-  const SRC = { product: 'Digital products', group: 'Communities', class: 'Classes', support: 'Support from fans', reward_received: 'Rewards', dropship: 'Dropshipping', dropship_supply: 'Supplying', sale: 'Sales' };
-  const nav = cur => '<div class="tabs">' + TABS.map(t => '<a class="tab ' + (cur === t[0] ? 'on' : '') + '" href="/creator' + (t[0] ? '/' + t[0] : '') + '">' + t[1] + '</a>').join('') + '</div>';
-  const stat = (label, val, sub) => '<div class="stat"><div class="muted small">' + label + '</div><div class="bal">' + val + '</div>' + (sub ? '<div class="muted small">' + sub + '</div>' : '') + '</div>';
-  const bars = (rows, label, val) => { const max = Math.max(1, ...rows.map(val)); return '<div class="bars">' + rows.map(r => '<div class="bar" title="' + esc(label(r)) + ': ' + val(r) + '"><i style="height:' + Math.max(3, val(r) / max * 100) + '%"></i></div>').join('') + '</div>'; };
+// Data behind the creator dashboard (/creator): everything a creator needs in one place.
+const express = require('express');
+const { db } = require('../db');
+const { requireAuth, featureOn } = require('../auth');
+const ownerfees = require('../ownerfees');
+const world = require('../world');
 
-  async function overview(view, days) {
-    const o = await DE.get('/creator/overview?days=' + days);
-    const total = o.income.map(i => DE.money(i.total, i.currency)).join(' + ') || DE.money(0);
-    view.innerHTML = '<div class="row between wrap"><h1>Creator studio</h1><div class="row"><select class="i" id="days"><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select><a class="btn primary" href="/">+ Create post</a></div></div>' + nav('') +
-      (o.todo.length ? '<div class="card"><h3>To do</h3>' + o.todo.map(t => '<a class="row" href="' + esc(t.link) + '" style="padding:6px 0;color:inherit">' + (t.urgent ? '🔴' : '🔹') + ' <span class="grow">' + esc(t.text) + '</span> ›</a>').join('') + '</div>' : '') +
-      '<div class="grid">' + stat('Earned', total, o.days + ' days') + stat('Followers', o.followers.total, '+' + o.followers.gained + ' new') + stat('Views', o.content.views, o.content.published + ' posts published') + stat('Reactions', o.content.reactions, o.content.comments + ' comments') + '</div>' +
-      '<div class="card"><h3>Wallet</h3>' + (o.wallet.map(w => '<span class="pill">' + DE.money(w.balance, w.currency) + '</span> ').join('') || '<span class="muted">Empty</span>') + (o.pending_withdrawals.length ? '<div class="muted small">Pending withdrawal: ' + o.pending_withdrawals.map(w => DE.money(w.total, w.currency)).join(', ') + '</div>' : '') + '<div class="row" style="margin-top:10px"><a class="btn" href="/wallet">Withdraw / manage money</a></div></div>' +
-      '<div class="card"><h3>Where your money comes from</h3>' + (o.by_source.length ? o.by_source.map(s => '<div class="row" style="padding:4px 0"><span class="grow">' + esc(SRC[s.source] || s.source) + '</span><span class="muted small">' + s.n + '×</span><b>' + DE.money(s.total, s.currency) + '</b></div>').join('') : '<p class="muted">No earnings in this period yet.</p>') + '</div>' +
-      '<div class="card"><h3>Top posts</h3>' + (o.top_posts.map(p => '<a class="row" href="/post/' + p.id + '" style="padding:6px 0;color:inherit"><span class="grow">' + esc(p.title || p.body || p.type) + '</span><span class="muted small">👁 ' + p.views + ' · ❤ ' + p.reactions + ' · 💬 ' + p.comments + '</span></a>').join('') || '<p class="muted">Post something to see how it performs.</p>') + '</div>' +
-      '<div class="grid"><div class="card"><h3>Classes</h3>' + (o.classes.map(c => '<a class="row" href="/class/' + c.id + '" style="color:inherit;padding:4px 0"><span class="grow">' + esc(c.title) + '</span><span class="muted small">' + c.enrolled + ' enrolled</span></a>').join('') || '<p class="muted">None yet.</p>') + '<a class="btn sm" href="/classes/new">Host a class</a></div>' +
-      '<div class="card"><h3>Communities</h3>' + (o.communities.map(c => '<a class="row" href="/community/' + c.id + '" style="color:inherit;padding:4px 0"><span class="grow">' + esc(c.name) + '</span><span class="muted small">' + c.members + ' members</span></a>').join('') || '<p class="muted">None yet.</p>') + '<a class="btn sm" href="/communities">Manage</a></div>' +
-      '<div class="card"><h3>Products</h3><p>' + o.products.count + ' live · ' + o.products.sold + ' sold</p><a class="btn sm" href="/sell">Sell a product</a></div>' +
-      '<div class="card"><h3>My page</h3>' + (o.page ? '<p><a href="/p/' + esc(o.page.slug) + '">' + esc(o.page.name) + '</a></p><a class="btn sm" href="/edit-page">Edit page</a>' : '<p class="muted">Create a creator page with your tools and links.</p><a class="btn sm primary" href="/create-page">Create page</a>') + '</div>' +
-      '<div class="card"><h3>My store</h3>' + (o.store ? '<p>' + esc(o.store.brand_name || o.store.slug) + ' · ' + o.store.orders + ' orders</p><a class="btn sm" href="/dropship">Open store hub</a>' : '<p class="muted">Sell printed and ready-made products delivered worldwide, with your brand.</p><a class="btn sm primary" href="/dropship">Start a store</a>') + '</div></div>';
-    DE.$('#days').value = days; DE.$('#days').onchange = e => overview(view, e.target.value);
-  }
+const router = express.Router();
+router.use(featureOn('creator_dashboard'));
+router.use(requireAuth);
 
-  DE.route('/creator', async view => { DE.title('Creator studio'); await overview(view, 30); }, { auth: true });
+const INCOME_TYPES = "('sale','reward_received','dropship_supply')";
+const daysParam = (q, def = 30) => Math.min(365, Math.max(1, parseInt(q, 10) || def));
 
-  DE.route('/creator/content', async view => {
-    DE.title('My content');
-    const type = DE.query().type || '';
-    const rows = await DE.get('/creator/content' + (type ? '?type=' + type : ''));
-    view.innerHTML = '<h1>Creator studio</h1>' + nav('content') + '<div class="chips">' + ['', 'text', 'image', 'video', 'audio', 'reel', 'story'].map(t => '<a class="chip ' + (type === t ? 'on' : '') + '" href="/creator/content' + (t ? '?type=' + t : '') + '">' + (t || 'all') + '</a>').join('') + '</div>' +
-      '<div class="card">' + (rows.length ? '<div class="tablewrap"><table><tr><th>Post</th><th>Type</th><th>👁</th><th>❤</th><th>💬</th><th>When</th><th></th></tr>' + rows.map(p => '<tr><td><a href="/post/' + p.id + '">' + esc(p.title || p.body || '(media)') + '</a></td><td>' + p.type + '</td><td>' + p.views + '</td><td>' + p.reactions + '</td><td>' + p.comments + '</td><td>' + DE.timeago(p.created_at) + '</td><td><button class="icon-btn" data-act="delete-post" data-id="' + p.id + '" aria-label="Delete">🗑</button></td></tr>').join('') + '</table></div>' : '<p class="muted">Nothing posted yet.</p>') + '</div>';
-  }, { auth: true });
+router.get('/overview', (req, res) => {
+  const uid = req.user.id;
+  const days = daysParam(req.query.days);
+  const win = '-' + days + ' days';
+  const one = (sql, ...a) => db.prepare(sql).get(...a).c;
 
-  DE.route('/creator/audience', async view => {
-    DE.title('My audience');
-    const a = await DE.get('/creator/audience');
-    view.innerHTML = '<h1>Creator studio</h1>' + nav('audience') +
-      '<div class="card"><h3>New followers (30 days)</h3>' + (a.growth.length ? bars(a.growth, r => r.day, r => r.n) : '<p class="muted">No new followers yet.</p>') + '</div>' +
-      '<div class="grid"><div class="card"><h3>Recent followers</h3>' + (a.recent.map(u => DE.userRow(u, false)).join('') || '<p class="muted">None yet.</p>') + '</div>' +
-      '<div class="card"><h3>Where they live</h3>' + (a.countries.map(c => '<div class="row"><span class="grow">' + esc(c.name) + '</span><b>' + c.n + '</b></div>').join('') || '<p class="muted">No location data.</p>') + '</div>' +
-      '<div class="card"><h3>Top supporters</h3>' + (a.supporters.map(s => '<div class="row"><a class="grow" href="/u/' + esc(s.username) + '">@' + esc(s.username) + '</a><b>' + DE.money(s.total, s.currency) + '</b></div>').join('') || '<p class="muted">None yet.</p>') + '</div>' +
-      '<div class="card"><h3>Most engaged</h3>' + (a.top_viewers.map(s => '<div class="row"><a class="grow" href="/u/' + esc(s.username) + '">@' + esc(s.username) + '</a><span class="muted small">' + s.views + ' views</span></div>').join('') || '<p class="muted">None yet.</p>') + '</div></div>';
-  }, { auth: true });
+  const income = db.prepare(`SELECT currency, SUM(amount) AS total, COUNT(*) AS n FROM wallet_tx WHERE user_id=? AND amount>0 AND type IN ${INCOME_TYPES} AND created_at>datetime('now',?) GROUP BY currency`).all(uid, win);
+  const bySource = db.prepare(`SELECT CASE WHEN w.ref LIKE 'do_%' THEN 'dropship' WHEN o.purpose IS NOT NULL THEN o.purpose WHEN t.ref IS NOT NULL THEN 'support' ELSE w.type END AS source,
+      w.currency, SUM(w.amount) AS total, COUNT(*) AS n
+    FROM wallet_tx w LEFT JOIN orders o ON o.ref=w.ref LEFT JOIN tips t ON t.ref=w.ref
+    WHERE w.user_id=? AND w.amount>0 AND w.type IN ${INCOME_TYPES} AND w.created_at>datetime('now',?) GROUP BY source, w.currency ORDER BY total DESC`).all(uid, win);
 
-  DE.route('/creator/earnings', async view => {
-    DE.title('My earnings');
-    const e = await DE.get('/creator/earnings?days=90');
-    view.innerHTML = '<h1>Creator studio</h1>' + nav('earnings') + '<div class="card"><h3>Last 90 days</h3>' + (e.daily.length ? bars(e.daily, r => r.day + ' ' + r.currency, r => r.total) : '<p class="muted">No earnings yet.</p>') + '</div>' +
-      '<div class="card"><h3>Recent payments received</h3>' + (e.recent.length ? '<div class="tablewrap"><table><tr><th>When</th><th>From</th><th>Amount</th><th>Note</th></tr>' + e.recent.map(r => '<tr><td>' + DE.timeago(r.created_at) + '</td><td>' + esc(SRC[r.source] || r.source) + '</td><td style="color:var(--ok)">+' + DE.money(r.amount, r.currency) + '</td><td>' + esc(r.note || '') + '</td></tr>').join('') + '</table></div>' : '<p class="muted">Nothing yet.</p>') + '</div><a class="btn primary" href="/wallet">Open wallet</a>';
-  }, { auth: true });
+  const store = db.prepare('SELECT id,slug,brand_name FROM stores WHERE owner_id=?').get(uid);
+  const hasSupplier = !!db.prepare('SELECT 1 FROM supplier_profiles WHERE user_id=?').get(uid);
+  const dueFees = ownerfees.dueInvoices(uid);
+  const todo = [];
+  dueFees.forEach(i => todo.push({ kind: 'fee', text: 'Pay ' + world.format(i.amount, i.currency) + ' - ' + (i.note || i.kind), link: '/creator/fees', urgent: !!(i.due_at && i.due_at < new Date().toISOString().slice(0, 19).replace('T', ' ')) }));
+  const toShip = hasSupplier ? one("SELECT COUNT(*) c FROM dropship_orders WHERE supplier_id=? AND status IN ('paid','awaiting_supplier','needs_attention','processing')", uid) : 0;
+  if (toShip) todo.push({ kind: 'ship', text: toShip + ' dropship order' + (toShip > 1 ? 's' : '') + ' waiting to ship', link: '/dropship' });
+  const refunds = store ? one("SELECT COUNT(*) c FROM dropship_orders WHERE store_id=? AND status='refund_needed'", store.id) : 0;
+  if (refunds) todo.push({ kind: 'refund', text: refunds + ' store order' + (refunds > 1 ? 's' : '') + ' need a customer refund', link: '/dropship', urgent: true });
+  const soon = db.prepare("SELECT id,title,starts_at FROM classes WHERE owner_id=? AND active=1 AND kind!='recorded' AND starts_at>datetime('now') AND starts_at<datetime('now','+2 days') ORDER BY starts_at LIMIT 3").all(uid);
+  soon.forEach(c => todo.push({ kind: 'class', text: 'Class "' + c.title + '" starts soon', link: '/class/' + c.id }));
+  const pendingAds = one("SELECT COUNT(*) c FROM ads WHERE owner_id=? AND status IN ('pending','pending_payment')", uid);
+  if (pendingAds) todo.push({ kind: 'ad', text: pendingAds + ' advert' + (pendingAds > 1 ? 's' : '') + ' not live yet', link: '/creator/ads' });
 
-  DE.route('/creator/fees', async view => {
-    DE.title('Fees');
-    const f = await DE.get('/pay/fees');
-    view.innerHTML = '<h1>Creator studio</h1>' + nav('fees') +
-      (f.waived ? '<div class="card">✅ The site owner has waived your platform fees.</div>' : '') +
-      '<div class="card"><h3>Due now</h3>' + (f.due.length ? f.due.map(i => '<div class="row" style="padding:8px 0"><span class="grow">' + esc(i.note || i.kind) + '<div class="muted small">' + (i.due_at ? 'Due ' + esc(String(i.due_at).slice(0, 10)) : '') + '</div></span><b>' + DE.money(i.amount, i.currency) + '</b><button class="btn sm primary" data-w="' + i.id + '">Pay from wallet</button><button class="btn sm" data-c="' + i.id + '">Pay online</button></div>').join('') : '<p class="muted">You do not owe anything.</p>') + '</div>' +
-      '<div class="card"><h3>How fees work</h3><ul><li>Class hosting: ' + (f.class_fee.on ? esc(f.class_fee.mode) + ' (' + esc(f.class_fee.when) + ')' : 'not charged') + '</li><li>Creator subscription: ' + (f.creator_fee.required ? DE.money(f.creator_fee.amount, f.creator_fee.currency) + ' every ' + f.creator_fee.days + ' days (' + esc(f.creator_fee.timing) + ')' : 'not charged') + '</li>' + (f.sub_until ? '<li>Subscription paid until ' + esc(String(f.sub_until).slice(0, 10)) + '</li>' : '') + '</ul></div>' +
-      '<div class="card"><h3>History</h3>' + (f.history.length ? '<div class="tablewrap"><table><tr><th>When</th><th>For</th><th>Amount</th><th>Status</th></tr>' + f.history.map(i => '<tr><td>' + DE.timeago(i.created_at) + '</td><td>' + esc(i.note || i.kind) + '</td><td>' + DE.money(i.amount, i.currency) + '</td><td><span class="pill ' + (i.status === 'paid' ? 'ok' : i.status === 'due' ? 'warn' : '') + '">' + esc(i.status) + '</span></td></tr>').join('') + '</table></div>' : '<p class="muted">No fees yet.</p>') + '</div>';
-    DE.$$('[data-w]').forEach(b => b.onclick = () => DE.busy(b, async () => { await DE.post('/pay/fees/' + b.dataset.w + '/pay-wallet'); DE.toast('Paid'); DE.render(); }));
-    DE.$$('[data-c]').forEach(b => b.onclick = () => DE.busy(b, () => DE.checkout({ purpose: 'owner_invoice', invoice_id: b.dataset.c })));
-  }, { auth: true });
+  res.json({
+    days,
+    followers: { total: one('SELECT COUNT(*) c FROM follows WHERE target_id=?', uid), gained: one("SELECT COUNT(*) c FROM follows WHERE target_id=? AND created_at>datetime('now',?)", uid, win) },
+    content: {
+      posts: one("SELECT COUNT(*) c FROM posts WHERE user_id=? AND type!='story'", uid),
+      reels: one("SELECT COUNT(*) c FROM posts WHERE user_id=? AND type='reel'", uid),
+      published: one("SELECT COUNT(*) c FROM posts WHERE user_id=? AND created_at>datetime('now',?)", uid, win),
+      views: one("SELECT COUNT(*) c FROM post_views v JOIN posts p ON p.id=v.post_id WHERE p.user_id=? AND v.viewed_at>datetime('now',?)", uid, win),
+      reactions: one("SELECT COUNT(*) c FROM likes l JOIN posts p ON p.id=l.post_id WHERE p.user_id=? AND l.created_at>datetime('now',?)", uid, win),
+      comments: one("SELECT COUNT(*) c FROM comments c JOIN posts p ON p.id=c.post_id WHERE p.user_id=? AND c.created_at>datetime('now',?) AND c.user_id!=?", uid, win, uid)
+    },
+    income, by_source: bySource,
+    wallet: db.prepare('SELECT currency,balance FROM wallets WHERE user_id=? AND balance!=0 ORDER BY balance DESC').all(uid),
+    pending_withdrawals: db.prepare("SELECT currency, SUM(amount) AS total, COUNT(*) AS n FROM withdrawals WHERE user_id=? AND status IN ('pending','processing') GROUP BY currency").all(uid),
+    top_posts: db.prepare(`SELECT p.id,p.type,p.title,substr(p.body,1,80) AS body,p.created_at,
+        (SELECT COUNT(*) FROM post_views WHERE post_id=p.id) AS views, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) AS reactions, (SELECT COUNT(*) FROM comments WHERE post_id=p.id) AS comments
+      FROM posts p WHERE p.user_id=? AND p.type!='story' ORDER BY (views + reactions*2 + comments*3) DESC LIMIT 5`).all(uid),
+    classes: db.prepare(`SELECT c.id,c.title,c.starts_at,c.price,c.currency,c.kind,c.active,(SELECT COUNT(*) FROM class_enrollments WHERE class_id=c.id) AS enrolled
+      FROM classes c WHERE c.owner_id=? ORDER BY c.starts_at DESC LIMIT 6`).all(uid),
+    communities: db.prepare('SELECT g.id,g.name,g.price,g.currency,g.billing,(SELECT COUNT(*) FROM active_members WHERE group_id=g.id) AS members FROM groups_ g WHERE g.owner_id=? ORDER BY members DESC LIMIT 6').all(uid),
+    products: { count: one('SELECT COUNT(*) c FROM products WHERE seller_id=? AND active=1', uid), sold: one("SELECT COUNT(*) c FROM orders o JOIN products p ON p.id=o.product_id WHERE p.seller_id=? AND o.status='paid'", uid) },
+    store: store ? { ...store, orders: one("SELECT COUNT(*) c FROM dropship_orders WHERE store_id=? AND status NOT IN ('awaiting_payment')", store.id), to_ship: refunds } : null,
+    supplier: hasSupplier ? { to_ship: toShip, products: one('SELECT COUNT(*) c FROM supplier_products WHERE supplier_id=? AND active=1', uid) } : null,
+    ads: db.prepare("SELECT COALESCE(SUM(impressions),0) AS impressions, COALESCE(SUM(clicks),0) AS clicks, COUNT(*) AS n FROM ads WHERE owner_id=? AND status='active'").get(uid),
+    fees_due: dueFees,
+    page: db.prepare('SELECT slug,name FROM pages WHERE owner_id=?').get(uid) || null,
+    todo
+  });
+});
 
-  DE.route('/creator/ads', async view => {
-    DE.title('Advertising');
-    const r = await DE.get('/ads/mine'); const p = r.pricing;
-    view.innerHTML = '<h1>Creator studio</h1>' + nav('ads') +
-      (p.enabled && p.self_serve ? '<div class="card"><h3>Promote something</h3><p class="muted small">' + (p.price_per_day ? DE.money(p.price_per_day, p.currency) + ' per day' : 'Free for now') + ' · up to ' + p.max_days + ' days · reviewed before going live</p><form id="af"><label class="f">Title</label><input class="i" name="title" maxlength="80" required><label class="f">Text</label><input class="i" name="body" maxlength="300"><label class="f">Link (https://)</label><input class="i" name="link_url" required>' +
-        '<div class="two"><div><label class="f">Where</label><select class="i" name="placement">' + p.placements.map(x => '<option>' + x + '</option>').join('') + '</select></div><div><label class="f">Days</label><input class="i" type="number" name="days" min="1" max="' + p.max_days + '" value="7"></div></div>' +
-        '<label class="f">Countries (codes like NG,GH — empty = everywhere)</label><input class="i" name="countries"><label class="f">Image or video</label><input class="i" type="file" name="media" accept="image/*,video/*"><div class="err" id="err"></div><button class="btn primary" style="margin-top:10px">Submit advert</button></form></div>' : '<div class="card muted">Advertising is not open right now.</div>') +
-      '<div class="card"><h3>My adverts</h3>' + (r.ads.length ? '<div class="tablewrap"><table><tr><th>Title</th><th>Status</th><th>Views</th><th>Clicks</th><th></th></tr>' + r.ads.map(a => '<tr><td>' + esc(a.title) + '</td><td><span class="pill">' + esc(a.status) + '</span>' + (a.reject_reason ? ' <span class="muted small">' + esc(a.reject_reason) + '</span>' : '') + '</td><td>' + a.impressions + '</td><td>' + a.clicks + '</td><td>' + (a.status === 'pending_payment' ? '<button class="btn sm primary" data-pay="' + a.id + '">Pay</button>' : '') + '<button class="btn sm danger" data-del="' + a.id + '">Delete</button></td></tr>').join('') + '</table></div>' : '<p class="muted">No adverts yet.</p>') + '</div>';
-    const f = DE.$('#af');
-    if (f) f.onsubmit = async e => { e.preventDefault(); const fd = new FormData(f); if (!fd.get('media').size) fd.delete('media'); DE.$('#err').textContent = ''; try { const x = await DE.post('/ads', fd); if (x.needs_payment) return DE.checkout({ purpose: 'ad', ad_id: x.id }); DE.toast('Submitted for review'); DE.render(); } catch (ex) { DE.$('#err').textContent = ex.message; } };
-    DE.$$('[data-pay]').forEach(b => b.onclick = () => DE.checkout({ purpose: 'ad', ad_id: b.dataset.pay }));
-    DE.$$('[data-del]').forEach(b => b.onclick = async () => { if (await DE.confirm('Delete this advert?', 'Delete')) { await DE.del('/ads/' + b.dataset.del); DE.render(); } });
-  }, { auth: true });
-})();
+router.get('/earnings', (req, res) => {
+  const days = daysParam(req.query.days, 90);
+  res.json({
+    days,
+    daily: db.prepare(`SELECT date(created_at) AS day, currency, SUM(amount) AS total FROM wallet_tx WHERE user_id=? AND amount>0 AND type IN ${INCOME_TYPES} AND created_at>datetime('now',?) GROUP BY day, currency ORDER BY day`).all(req.user.id, '-' + days + ' days'),
+    recent: db.prepare(`SELECT w.id,w.type,w.amount,w.currency,w.note,w.created_at, CASE WHEN w.ref LIKE 'do_%' THEN 'dropship' WHEN o.purpose IS NOT NULL THEN o.purpose WHEN t.ref IS NOT NULL THEN 'support' ELSE w.type END AS source
+      FROM wallet_tx w LEFT JOIN orders o ON o.ref=w.ref LEFT JOIN tips t ON t.ref=w.ref WHERE w.user_id=? AND w.amount>0 AND w.type IN ${INCOME_TYPES} ORDER BY w.id DESC LIMIT 30`).all(req.user.id)
+  });
+});
+
+router.get('/content', (req, res) => {
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  const type = ['text', 'image', 'video', 'audio', 'reel', 'story'].includes(req.query.type) ? req.query.type : null;
+  res.json(db.prepare(`SELECT p.id,p.type,p.title,substr(p.body,1,140) AS body,p.media,p.category,p.created_at,p.group_id,
+      (SELECT COUNT(*) FROM post_views WHERE post_id=p.id) AS views, (SELECT COUNT(*) FROM likes WHERE post_id=p.id) AS reactions, (SELECT COUNT(*) FROM comments WHERE post_id=p.id) AS comments
+    FROM posts p WHERE p.user_id=? ${type ? 'AND p.type=?' : ''} ORDER BY p.id DESC LIMIT 20 OFFSET ?`).all(...(type ? [req.user.id, type, offset] : [req.user.id, offset])));
+});
+
+router.get('/audience', (req, res) => {
+  const uid = req.user.id;
+  res.json({
+    recent: db.prepare(`SELECT u.id,u.username,u.display_name,u.avatar,f.created_at FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.target_id=? AND u.status='active' ORDER BY f.created_at DESC LIMIT 20`).all(uid),
+    growth: db.prepare("SELECT date(created_at) AS day, COUNT(*) AS n FROM follows WHERE target_id=? AND created_at>datetime('now','-30 days') GROUP BY day ORDER BY day").all(uid),
+    countries: db.prepare(`SELECT u.country AS code, COUNT(*) AS n FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.target_id=? AND u.country IS NOT NULL GROUP BY u.country ORDER BY n DESC LIMIT 10`).all(uid)
+      .map(c => ({ ...c, name: (world.countries.find(x => x.code === c.code) || {}).name || c.code })),
+    supporters: db.prepare(`SELECT u.username,u.avatar,t.currency,SUM(t.amount) AS total,COUNT(*) AS times FROM tips t JOIN users u ON u.id=t.from_id WHERE t.to_id=? AND t.status='paid' GROUP BY t.from_id,t.currency ORDER BY total DESC LIMIT 10`).all(uid),
+    top_viewers: db.prepare(`SELECT u.username,u.avatar,COUNT(*) AS views FROM post_views v JOIN posts p ON p.id=v.post_id JOIN users u ON u.id=v.viewer_id WHERE p.user_id=? GROUP BY v.viewer_id ORDER BY views DESC LIMIT 10`).all(uid)
+  });
+});
+
+module.exports = router;

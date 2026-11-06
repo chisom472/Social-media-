@@ -1,375 +1,773 @@
-/* Control dashboard. Every section only appears if the signed-in person has that permission (the owner has all). */
-(function () {
-  const DE = window.DE, esc = DE.esc, $ = DE.$, $$ = DE.$$;
-  let ME = null, SECTION = 'overview';
-  const can = p => !p || (ME && (ME.owner || ME.permissions.includes(p)));
-  const T = (rows, cols, empty) => rows && rows.length ? '<div class="tablewrap"><table><tr>' + cols.map(c => '<th>' + c[1] + '</th>').join('') + '</tr>' + rows.map(r => '<tr>' + cols.map(c => '<td>' + (c[2] ? c[2](r) : esc(r[c[0]] == null ? '' : r[c[0]])) + '</td>').join('') + '</tr>').join('') + '</table></div>' : '<p class="muted">' + (empty || 'Nothing here.') + '</p>';
-  const when = s => (s ? esc(String(s).slice(0, 16)) : '');
-  const card = (h, body) => '<div class="card"><h3>' + h + '</h3>' + body + '</div>';
-  const pill = (t, k) => '<span class="pill ' + (k || '') + '">' + esc(t) + '</span>';
-  const A = path => '/admin' + path;
-  const stepUp = async () => new Promise(res => DE.modal('<h2>Confirm it is you</h2><p class="muted">Enter your password to continue.</p><input class="i" type="password" id="spw" autocomplete="current-password"><div class="row" style="margin-top:12px"><button class="btn primary" id="spok">Continue</button><button class="btn" data-close>Cancel</button></div>', (m, close) => { m.querySelector('#spok').onclick = () => { const v = m.querySelector('#spw').value; close(); res(v); }; m.querySelector('[data-close]').addEventListener('click', () => res(null)); }));
-  const ask = (title, fields, okLabel) => new Promise(res => DE.modal('<h2>' + title + '</h2>' + fields.map(f => '<label class="f">' + f.label + '</label>' + (f.type === 'textarea' ? '<textarea class="i" id="f_' + f.k + '" rows="5">' + esc(f.v || '') + '</textarea>' : f.type === 'select' ? '<select class="i" id="f_' + f.k + '">' + f.options.map(o => '<option value="' + esc(o[0]) + '"' + (String(o[0]) === String(f.v) ? ' selected' : '') + '>' + esc(o[1]) + '</option>').join('') + '</select>' : f.type === 'check' ? '<label class="row"><input type="checkbox" id="f_' + f.k + '"' + (f.v ? ' checked' : '') + '> ' + esc(f.hint || '') + '</label>' : '<input class="i" id="f_' + f.k + '" type="' + (f.type || 'text') + '" value="' + esc(f.v == null ? '' : f.v) + '"' + (f.ph ? ' placeholder="' + esc(f.ph) + '"' : '') + '>')).join('') + '<div class="err" id="aerr"></div><div class="row" style="margin-top:12px"><button class="btn primary" id="aok">' + (okLabel || 'Save') + '</button><button class="btn" data-close>Cancel</button></div>', (m, close) => {
-    m.querySelector('#aok').onclick = () => { const o = {}; fields.forEach(f => { const e = m.querySelector('#f_' + f.k); o[f.k] = f.type === 'check' ? e.checked : e.value; }); close(); res(o); };
-    m.querySelector('[data-close]').addEventListener('click', () => res(null));
+// Owner / staff control dashboard API.
+// The owner (role 'admin') can do everything. Staff (role 'staff') can only use the sections the owner ticked for them
+// in Admin > Team. Every route below says which permission it needs.
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { db, getSetting, setSetting, allSettings, notify, DEFAULT_SETTINGS, SECRET_SETTINGS } = require('../db');
+const { requireStaff, requirePerm, hasPerm, PERMISSIONS, RESTRICTION_KEYS } = require('../auth');
+const { slugify, sanitizeHtml, safeUrl, assertPublicUrl } = require('../utils');
+const secrets = require('../secrets');
+const world = require('../world');
+const providers = require('../providers');
+const payments = require('./payments');
+const fx = require('../fx');
+const ownerfees = require('../ownerfees');
+const announce = require('../announce');
+const ai = require('../ai');
+
+const router = express.Router();
+router.use(requireStaff);
+
+const MASK = '********';
+const jparse = (s, d) => { try { return JSON.parse(s); } catch (e) { return d; } };
+const base = req => process.env.SITE_URL || (req.protocol + '://' + req.get('host'));
+const owner = (req, res, next) => (req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Only the owner can do this.' }));
+
+function audit(req, action, detail) {
+  db.prepare('INSERT INTO audit_log(admin_id,action,detail) VALUES(?,?,?)').run(req.user.id, action, String(detail || '').slice(0, 500));
+}
+
+/** Staff may never touch the owner or other staff accounts. */
+function targetUser(req, res) {
+  const u = db.prepare('SELECT id,username,role,status FROM users WHERE id=?').get(req.params.id);
+  if (!u) { res.status(404).json({ error: 'User not found.' }); return null; }
+  if (u.role !== 'user' && req.user.role !== 'admin') { res.status(403).json({ error: 'Only the owner can change admin accounts.' }); return null; }
+  if (u.id === req.user.id) { res.status(400).json({ error: 'You cannot do this to your own account.' }); return null; }
+  return u;
+}
+
+// ---------- Who am I ----------
+router.get('/me', (req, res) => {
+  const all = Object.keys(PERMISSIONS);
+  res.json({ id: req.user.id, username: req.user.username, role: req.user.role, owner: req.user.role === 'admin',
+    permissions: req.user.role === 'admin' ? all : String(req.user.permissions || '').split(',').filter(Boolean), catalogue: PERMISSIONS });
+});
+
+router.get('/stats', requirePerm('users_view', 'payments_view', 'content', 'site'), (req, res) => {
+  const c = sql => db.prepare(sql).get().c;
+  const money = hasPerm(req.user, 'payments_view');
+  res.json({
+    users: c('SELECT COUNT(*) c FROM users'),
+    active_users: c("SELECT COUNT(*) c FROM users WHERE status='active'"),
+    suspended: c("SELECT COUNT(*) c FROM users WHERE status!='active'"),
+    new_week: c("SELECT COUNT(*) c FROM users WHERE created_at > datetime('now','-7 days')"),
+    online_now: c("SELECT COUNT(*) c FROM users WHERE last_seen > datetime('now','-5 minutes')"),
+    creators: c('SELECT COUNT(*) c FROM pages'),
+    posts: c('SELECT COUNT(*) c FROM posts'),
+    reels: c("SELECT COUNT(*) c FROM posts WHERE type='reel'"),
+    groups: c('SELECT COUNT(*) c FROM groups_'),
+    classes: c('SELECT COUNT(*) c FROM classes'),
+    stores: c('SELECT COUNT(*) c FROM stores'),
+    open_reports: c("SELECT COUNT(*) c FROM reports WHERE status='open'"),
+    dropship_attention: c("SELECT COUNT(*) c FROM dropship_orders WHERE status IN ('needs_attention','refund_needed')"),
+    ...(money ? {
+      orders_paid: c("SELECT COUNT(*) c FROM orders WHERE status='paid'"),
+      gross_volume: db.prepare("SELECT currency, SUM(amount) AS total FROM orders WHERE status='paid' AND purpose!='fund' GROUP BY currency").all(),
+      owner_earnings: db.prepare("SELECT currency, SUM(amount) AS total FROM wallet_tx WHERE user_id=? AND type IN ('commission','creator_fee','class_fee','ad','dropship_capital') GROUP BY currency").all(payments.adminId()),
+      pending_withdrawals: c("SELECT COUNT(*) c FROM withdrawals WHERE status='pending'"),
+      manual_review: c("SELECT COUNT(*) c FROM orders WHERE status='review'"),
+      invoices_due: c("SELECT COUNT(*) c FROM owner_invoices WHERE status='due'")
+    } : {}),
+    default_currency: getSetting('default_currency')
+  });
+});
+
+// =====================================================================================
+// Team (owner only): create staff and choose exactly what each can do
+// =====================================================================================
+router.get('/team', owner, (req, res) => {
+  res.json({ catalogue: PERMISSIONS, staff: db.prepare("SELECT id,username,display_name,email,role,permissions,status,last_seen FROM users WHERE role='staff' ORDER BY id").all() });
+});
+const cleanPerms = list => (Array.isArray(list) ? list : String(list || '').split(',')).map(s => String(s).trim()).filter(k => PERMISSIONS[k]).join(',');
+router.post('/team', owner, (req, res) => {
+  const who = String((req.body || {}).user || '').trim().replace(/^@/, '').toLowerCase();
+  const u = db.prepare('SELECT id,username,role FROM users WHERE lower(username)=? OR lower(email)=?').get(who, who);
+  if (!u) return res.status(404).json({ error: 'No user with that username or email. Ask them to sign up first.' });
+  if (u.role === 'admin') return res.status(400).json({ error: 'That is the owner account.' });
+  db.prepare("UPDATE users SET role='staff', permissions=?, token_version=token_version WHERE id=?").run(cleanPerms((req.body || {}).permissions), u.id);
+  notify(u.id, 'staff', 'You were added to the admin team. Open the Admin dashboard.', '/admin');
+  audit(req, 'team-add', '@' + u.username + ' [' + cleanPerms((req.body || {}).permissions) + ']');
+  res.json({ ok: true });
+});
+router.put('/team/:id', owner, (req, res) => {
+  const u = db.prepare("SELECT id,username FROM users WHERE id=? AND role='staff'").get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Staff member not found.' });
+  db.prepare('UPDATE users SET permissions=? WHERE id=?').run(cleanPerms((req.body || {}).permissions), u.id);
+  audit(req, 'team-permissions', '@' + u.username + ' [' + cleanPerms((req.body || {}).permissions) + ']');
+  res.json({ ok: true });
+});
+router.delete('/team/:id', owner, (req, res) => {
+  const u = db.prepare("SELECT id,username FROM users WHERE id=? AND role='staff'").get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Staff member not found.' });
+  db.prepare("UPDATE users SET role='user', permissions='', token_version=token_version+1 WHERE id=?").run(u.id);
+  audit(req, 'team-remove', '@' + u.username);
+  res.json({ ok: true });
+});
+
+// ---------- Paying the team (owner only, any time, any currency) ----------
+// "wallet": taken from the owner's own wallet balance. "external": the owner is paying from money held outside the app
+// (a provider balance, a bank, crypto) - the staff member's wallet is credited and the owner settles it when approving
+// that staff member's withdrawal. Either way the staff member withdraws like anyone: any currency (naira included), any
+// Nigerian bank or fintech app, or crypto.
+router.post('/team/:id/pay', owner, (req, res) => {
+  const u = db.prepare("SELECT id,username FROM users WHERE id=? AND role='staff'").get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Staff member not found.' });
+  const b = req.body || {};
+  const cur = world.normCurrency(b.currency, null);
+  const amount = cur ? world.toMinor(b.amount, cur) : 0;
+  if (!cur || amount <= 0) return res.status(400).json({ error: 'Enter an amount and choose a currency.' });
+  const source = b.source === 'external' ? 'external' : 'wallet';
+  const note = String(b.note || 'Payment from the owner').slice(0, 200);
+  try {
+    db.transaction(() => {
+      if (source === 'wallet') payments.debit(req.user.id, amount, cur, 'staff_pay', 'staff' + u.id, 'Paid @' + u.username + ': ' + note);
+      payments.credit(u.id, amount, cur, 'staff_pay', 'staff' + req.user.id, note);
+      db.prepare('INSERT INTO staff_payments(staff_id,amount,currency,source,note,created_by) VALUES(?,?,?,?,?,?)').run(u.id, amount, cur, source, note, req.user.id);
+    })();
+  } catch (e) { return res.status(e.status || 500).json({ error: e.message }); }
+  notify(u.id, 'payment', 'You received ' + world.format(amount, cur) + ' from the owner. Withdraw it from your wallet.', '/wallet');
+  audit(req, 'staff-pay', '@' + u.username + ' ' + world.format(amount, cur) + ' (' + source + ')');
+  res.json({ ok: true });
+});
+router.get('/team/:id/payments', owner, (req, res) => {
+  res.json(db.prepare('SELECT id,amount,currency,source,note,created_at FROM staff_payments WHERE staff_id=? ORDER BY id DESC LIMIT 100').all(req.params.id));
+});
+router.get('/my-pay', (req, res) => { // a team member sees what they were paid
+  res.json({ payments: db.prepare('SELECT id,amount,currency,source,note,created_at FROM staff_payments WHERE staff_id=? ORDER BY id DESC LIMIT 100').all(req.user.id),
+    wallets: db.prepare('SELECT currency,balance FROM wallets WHERE user_id=? AND balance>0').all(req.user.id) });
+});
+
+// =====================================================================================
+// Settings. Each setting needs the permission for its area. The owner can change all of them.
+// =====================================================================================
+const OWNER_ONLY = /^(smtp_|sms_|google_|vapid_|printful_api_token|printful_webhook_token|printify_api_token|printify_webhook_secret|cj_api_key|min_age$|dropship_user_suppliers$)/;
+function settingPerm(k) {
+  if (OWNER_ONLY.test(k)) return 'owner';
+  if (/^(paystack|flutterwave|stripe|paypal|tap_|wise_|nowpayments|btcpay|manual_|owner_(country|bank|account|swift)|accepted_currencies|fx_|ng_)/.test(k)) return 'settings_payments';
+  if (/fee|commission|owner_payments|^pay_.*_enabled|owner_fee|^class_|^creator_/.test(k)) return 'fees';  // includes dropship_fee_*
+  if (/^ads_/.test(k)) return 'ads';
+  if (/^ai_/.test(k)) return 'ai';
+  if (/^(printful|printify|cj_|pod_|dropship|pay_dropship|store_domain)/.test(k)) return 'dropship';
+  if (/^(policy|terms|privacy)/.test(k)) return 'writeups';
+  return 'site';
+}
+router.get('/settings', (req, res) => {
+  const s = allSettings();
+  const out = {};
+  Object.keys(s).forEach(k => {
+    const p = settingPerm(k);
+    if (p === 'owner' ? req.user.role !== 'admin' : !hasPerm(req.user, p)) return;
+    out[k] = SECRET_SETTINGS.has(k) ? (s[k] ? MASK : '') : s[k];
+  });
+  out._perm = Object.fromEntries(Object.keys(out).map(k => [k, settingPerm(k)]));
+  res.json(out);
+});
+router.put('/settings', (req, res) => {
+  const body = req.body || {};
+  const changed = [], denied = [];
+  Object.keys(body).forEach(k => {
+    if (!(k in DEFAULT_SETTINGS)) return;
+    const p = settingPerm(k);
+    if (p === 'owner' ? req.user.role !== 'admin' : !hasPerm(req.user, p)) { denied.push(k); return; }
+    let v = body[k];
+    if (SECRET_SETTINGS.has(k) && v === MASK) return;
+    if (typeof v === 'boolean') v = v ? '1' : '0';
+    v = String(v == null ? '' : v);
+    if (/^(policy_html|terms_html|privacy_html)$/.test(k)) v = sanitizeHtml(v);
+    setSetting(k, v);
+    changed.push(SECRET_SETTINGS.has(k) ? k + ' (secret)' : k);
+  });
+  if (changed.length) audit(req, 'settings', changed.join(', '));
+  res.json({ ok: true, changed, denied });
+});
+
+// =====================================================================================
+// Users
+// =====================================================================================
+router.get('/users', requirePerm('users_view'), (req, res) => {
+  const priv = hasPerm(req.user, 'users_private');
+  const q = '%' + String(req.query.q || '').replace(/[%_]/g, '') + '%';
+  const cc = /^[A-Za-z]{2}$/.test(req.query.country || '') ? String(req.query.country).toUpperCase() : null;
+  const rows = db.prepare(`SELECT u.id,u.username,u.display_name,u.role,u.status,u.is_creator,u.favoured,u.restrictions,u.owner_fee_waived,u.country,u.signup_country,u.last_country,u.created_at,u.last_seen,
+      ${priv ? 'u.email,u.phone,u.dob,u.city,u.region,' : ''}
+      (SELECT COUNT(*) FROM posts WHERE user_id=u.id) AS posts
+    FROM users u WHERE (u.username LIKE ? OR u.display_name LIKE ? ${priv ? 'OR u.email LIKE ? OR u.phone LIKE ?' : ''}) ${cc ? 'AND (u.country=? OR (u.country IS NULL AND u.last_country=?))' : ''}
+    ORDER BY u.id DESC LIMIT 300`).all(...[q, q, ...(priv ? [q, q] : []), ...(cc ? [cc, cc] : [])]);
+  res.json(rows);
+});
+
+router.get('/users/countries', requirePerm('users_view'), (req, res) => {
+  res.json(db.prepare(`SELECT COALESCE(country, last_country, signup_country) AS country, COUNT(*) AS users FROM users GROUP BY 1 ORDER BY users DESC`).all()
+    .map(r => ({ ...r, name: (world.countries.find(c => c.code === r.country) || {}).name || (r.country ? r.country : 'Unknown') })));
+});
+
+router.get('/users/export.csv', requirePerm('users_private'), (req, res) => {
+  const rows = db.prepare('SELECT id,username,display_name,email,phone,dob,country,region,city,signup_country,last_country,status,role,created_at,last_seen FROM users ORDER BY id').all();
+  const cols = Object.keys(rows[0] || { id: 1 });
+  const cell = v => { v = v == null ? '' : String(v); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; }; // stops spreadsheet formula injection
+  audit(req, 'export-users', rows.length + ' rows');
+  res.type('text/csv').set('Content-Disposition', 'attachment; filename="users.csv"').send([cols.join(',')].concat(rows.map(r => cols.map(c => cell(r[c])).join(','))).join('\n'));
+});
+
+router.get('/users/:id', requirePerm('users_view'), (req, res) => {
+  const priv = hasPerm(req.user, 'users_private');
+  const u = db.prepare(`SELECT id,username,display_name,bio,avatar,role,permissions,status,is_creator,favoured,restrictions,restriction_note,owner_fee_waived,commission_override,class_fee_override,creator_fee_override,
+      country,signup_country,last_country,location_privacy,interests,google_sub IS NOT NULL AS has_google,created_at,last_seen,failed_logins,locked_until
+      ${priv ? ',email,phone,dob,region,city' : ''} FROM users WHERE id=?`).get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  if (priv) audit(req, 'view-private', '@' + u.username);
+  const one = sql => db.prepare(sql).get(u.id);
+  res.json({
+    user: u,
+    stats: { posts: one('SELECT COUNT(*) c FROM posts WHERE user_id=?').c, followers: one('SELECT COUNT(*) c FROM follows WHERE target_id=?').c, following: one('SELECT COUNT(*) c FROM follows WHERE follower_id=?').c,
+      pages: one('SELECT COUNT(*) c FROM pages WHERE owner_id=?').c, communities: one('SELECT COUNT(*) c FROM groups_ WHERE owner_id=?').c, classes: one('SELECT COUNT(*) c FROM classes WHERE owner_id=?').c, store: !!one('SELECT id FROM stores WHERE owner_id=?') },
+    wallets: hasPerm(req.user, 'payments_view') ? db.prepare('SELECT currency,balance FROM wallets WHERE user_id=?').all(u.id) : undefined,
+    invoices: hasPerm(req.user, 'payments_view') ? db.prepare('SELECT id,kind,amount,currency,status,due_at,note FROM owner_invoices WHERE user_id=? ORDER BY id DESC LIMIT 20').all(u.id) : undefined,
+    logins: priv ? db.prepare('SELECT ok,country,ua,created_at FROM login_events WHERE user_id=? ORDER BY id DESC LIMIT 15').all(u.id) : undefined
+  });
+});
+
+router.post('/users/:id/status', requirePerm('users_manage'), (req, res) => {
+  const status = (req.body || {}).status;
+  if (!['active', 'suspended', 'banned'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
+  const u = targetUser(req, res); if (!u) return;
+  db.prepare('UPDATE users SET status=?, token_version=token_version+1 WHERE id=?').run(status, u.id);
+  audit(req, 'user-status', '@' + u.username + ' -> ' + status);
+  res.json({ ok: true });
+});
+
+router.put('/users/:id/flags', requirePerm('users_manage'), (req, res) => {
+  const u = targetUser(req, res); if (!u) return;
+  const b = req.body || {};
+  const sets = [], vals = [];
+  const add = (c, v) => { sets.push(c + '=?'); vals.push(v); };
+  if (b.favoured != null) add('favoured', b.favoured ? 1 : 0);
+  if (b.restrictions != null) {
+    const list = (Array.isArray(b.restrictions) ? b.restrictions : String(b.restrictions).split(',')).map(s => s.trim()).filter(k => k === 'all' || RESTRICTION_KEYS[k]);
+    add('restrictions', [...new Set(list)].join(','));
+    add('restriction_note', String(b.restriction_note || '').slice(0, 200) || null);
+  }
+  const num = (v, min, max) => (v === '' || v == null ? null : Math.min(max, Math.max(min, Number(v))));
+  if ('commission_override' in b && hasPerm(req.user, 'fees')) add('commission_override', num(b.commission_override, 0, 100));
+  if ('class_fee_override' in b && hasPerm(req.user, 'fees')) add('class_fee_override', b.class_fee_override === '' || b.class_fee_override == null ? null : Math.max(0, parseInt(b.class_fee_override, 10) || 0));
+  if ('creator_fee_override' in b && hasPerm(req.user, 'fees')) add('creator_fee_override', b.creator_fee_override === '' || b.creator_fee_override == null ? null : Math.max(0, parseInt(b.creator_fee_override, 10) || 0));
+  if (b.owner_fee_waived != null && hasPerm(req.user, 'fees')) add('owner_fee_waived', b.owner_fee_waived ? 1 : 0);
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to change.' });
+  db.prepare(`UPDATE users SET ${sets.join(',')} WHERE id=?`).run(...vals, u.id);
+  audit(req, 'user-flags', '@' + u.username + ' ' + JSON.stringify(b).slice(0, 200));
+  res.json({ ok: true });
+});
+
+router.post('/users/:id/grant-creator', requirePerm('payments_manage', 'fees'), (req, res) => {
+  const days = Math.min(3650, Math.max(1, parseInt((req.body || {}).days, 10) || 30));
+  const u = targetUser(req, res); if (!u) return;
+  db.prepare(`INSERT INTO creator_subscriptions(user_id,paid_until) VALUES(?, datetime('now', ?))
+    ON CONFLICT(user_id) DO UPDATE SET paid_until=excluded.paid_until, updated_at=CURRENT_TIMESTAMP`).run(u.id, '+' + days + ' days');
+  notify(u.id, 'creator', 'The owner granted you ' + days + ' days of creator access', '/creator');
+  audit(req, 'grant-creator', '@' + u.username + ' ' + days + 'd');
+  res.json({ ok: true });
+});
+
+// The owner never sees a user's password. They can set a temporary one or create a one-time reset link to send.
+router.post('/users/:id/reset-link', requirePerm('users_manage'), (req, res) => {
+  const u = targetUser(req, res); if (!u) return;
+  const token = crypto.randomBytes(24).toString('hex');
+  db.prepare('DELETE FROM password_resets WHERE user_id=?').run(u.id);
+  db.prepare("INSERT INTO password_resets(token_hash,user_id,expires_at) VALUES(?,?,datetime('now','+1 hour'))").run(crypto.createHash('sha256').update(token).digest('hex'), u.id);
+  audit(req, 'reset-link', '@' + u.username);
+  res.json({ link: base(req) + '/reset/' + token, expires: '1 hour' });
+});
+router.post('/users/:id/reset-password', requirePerm('users_manage'), (req, res) => {
+  const pw = String((req.body || {}).password || '');
+  if (pw.length < 10) return res.status(400).json({ error: 'Password must be at least 10 characters.' });
+  const u = targetUser(req, res); if (!u) return;
+  db.prepare('UPDATE users SET password_hash=?, token_version=token_version+1, failed_logins=0, locked_until=NULL WHERE id=?').run(bcrypt.hashSync(pw, 12), u.id);
+  audit(req, 'reset-password', '@' + u.username);
+  res.json({ ok: true });
+});
+router.post('/users/:id/unlock', requirePerm('users_manage'), (req, res) => {
+  const u = targetUser(req, res); if (!u) return;
+  db.prepare('UPDATE users SET failed_logins=0, locked_until=NULL WHERE id=?').run(u.id);
+  audit(req, 'unlock', '@' + u.username);
+  res.json({ ok: true });
+});
+router.delete('/users/:id', requirePerm('users_delete'), (req, res) => {
+  const u = targetUser(req, res); if (!u) return;
+  if (u.role !== 'user') return res.status(400).json({ error: 'Remove them from the team first.' });
+  db.prepare('DELETE FROM users WHERE id=?').run(u.id);
+  audit(req, 'delete-user', '@' + u.username);
+  res.json({ ok: true });
+});
+
+// =====================================================================================
+// Content moderation and reports
+// =====================================================================================
+const KINDS = {
+  posts: { tbl: 'posts', sql: `SELECT p.id,p.type,p.title,substr(p.body,1,120) AS body,p.created_at,u.username FROM posts p JOIN users u ON u.id=p.user_id ORDER BY p.id DESC LIMIT 150` },
+  pages: { tbl: 'pages', sql: `SELECT p.id,p.slug,p.name,p.category,p.created_at,u.username FROM pages p JOIN users u ON u.id=p.owner_id ORDER BY p.id DESC LIMIT 150` },
+  groups: { tbl: 'groups_', sql: `SELECT g.id,g.name,g.focus,g.price,g.currency,g.created_at,u.username FROM groups_ g JOIN users u ON u.id=g.owner_id ORDER BY g.id DESC LIMIT 150` },
+  products: { tbl: 'products', sql: `SELECT p.id,p.title,p.kind,p.price,p.currency,p.active,u.username FROM products p JOIN users u ON u.id=p.seller_id ORDER BY p.id DESC LIMIT 150` },
+  classes: { tbl: 'classes', sql: `SELECT c.id,c.title,c.price,c.currency,c.starts_at,c.kind,u.username FROM classes c JOIN users u ON u.id=c.owner_id ORDER BY c.id DESC LIMIT 150` }
+};
+router.get('/content/:kind', requirePerm('content'), (req, res) => {
+  const k = KINDS[req.params.kind];
+  if (!k) return res.status(404).json({ error: 'Unknown content type.' });
+  res.json(db.prepare(k.sql).all());
+});
+router.delete('/content/:kind/:id', requirePerm('content'), (req, res) => {
+  const k = KINDS[req.params.kind];
+  if (!k) return res.status(404).json({ error: 'Unknown content type.' });
+  if (req.params.kind === 'classes' && db.prepare("SELECT 1 FROM orders WHERE class_id=? AND status='paid'").get(req.params.id)) return res.status(400).json({ error: 'This class has paid students. Cancel and refund them first.' });
+  db.prepare(`DELETE FROM ${k.tbl} WHERE id=?`).run(req.params.id);
+  audit(req, 'delete-' + req.params.kind, '#' + req.params.id);
+  res.json({ ok: true });
+});
+router.get('/reports', requirePerm('reports'), (req, res) => {
+  res.json(db.prepare(`SELECT r.*, u.username AS reporter FROM reports r LEFT JOIN users u ON u.id=r.reporter_id ORDER BY r.status='open' DESC, r.id DESC LIMIT 200`).all());
+});
+router.post('/reports/:id/resolve', requirePerm('reports'), (req, res) => {
+  db.prepare("UPDATE reports SET status='resolved' WHERE id=?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+// =====================================================================================
+// Money: transactions, manual approvals, withdrawals
+// =====================================================================================
+router.get('/transactions', requirePerm('payments_view'), (req, res) => {
+  res.json(db.prepare(`SELECT o.id,o.ref,o.purpose,o.amount,o.currency,o.provider,o.status,o.created_at,COALESCE(u.username, o.buyer_email, 'guest') AS buyer FROM orders o LEFT JOIN users u ON u.id=o.buyer_id ORDER BY o.id DESC LIMIT 300`).all());
+});
+
+router.get('/manual-payments', requirePerm('payments_view'), (req, res) => {
+  res.json(db.prepare(`SELECT o.id,o.ref,o.purpose,o.amount,o.currency,o.provider,o.proof,o.proof_note,o.created_at,COALESCE(u.username, o.buyer_email) AS buyer FROM orders o LEFT JOIN users u ON u.id=o.buyer_id
+    WHERE o.status='review' ORDER BY o.id DESC LIMIT 100`).all());
+});
+router.post('/manual-payments/:id/approve', requirePerm('payments_manage'), (req, res) => {
+  const o = db.prepare("SELECT * FROM orders WHERE id=? AND status='review'").get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Nothing to approve.' });
+  const r = payments.finalize(o.ref, o.amount, o.currency);
+  audit(req, 'manual-approve', o.ref + ' ' + o.amount + ' ' + o.currency);
+  res.json(r.ok ? { ok: true } : { error: r.error || 'Could not approve.' });
+});
+router.post('/manual-payments/:id/reject', requirePerm('payments_manage'), (req, res) => {
+  const o = db.prepare("SELECT * FROM orders WHERE id=? AND status='review'").get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Nothing to reject.' });
+  db.prepare("UPDATE orders SET status='failed' WHERE id=?").run(o.id);
+  if (o.buyer_id) notify(o.buyer_id, 'payment', 'We could not confirm your payment ' + o.ref + '. ' + String((req.body || {}).note || ''), '/wallet');
+  audit(req, 'manual-reject', o.ref);
+  res.json({ ok: true });
+});
+
+router.get('/withdrawals', requirePerm('payments_view'), (req, res) => {
+  const rows = db.prepare(`SELECT w.*, u.username FROM withdrawals w JOIN users u ON u.id=w.user_id ORDER BY w.status='pending' DESC, w.id DESC LIMIT 200`).all();
+  rows.forEach(r => { r.bank = jparse(r.bank_snapshot, {}); delete r.bank_snapshot; });
+  res.json(rows);
+});
+router.post('/withdrawals/:id/approve', requirePerm('payments_manage'), (req, res) => {
+  const w = db.prepare('SELECT * FROM withdrawals WHERE id=?').get(req.params.id);
+  if (!w || w.status !== 'pending') return res.status(400).json({ error: 'Not pending.' });
+  const note = String((req.body || {}).txid || (req.body || {}).note || 'Paid by the owner').slice(0, 200);
+  db.prepare("UPDATE withdrawals SET status='paid', note=? WHERE id=?").run(note, w.id);
+  notify(w.user_id, 'withdrawal', 'Your withdrawal of ' + world.format(w.amount, w.currency) + ' has been paid.', '/wallet');
+  audit(req, 'withdrawal-paid', '#' + w.id);
+  res.json({ ok: true });
+});
+router.post('/withdrawals/:id/reject', requirePerm('payments_manage'), (req, res) => {
+  const w = db.prepare('SELECT * FROM withdrawals WHERE id=?').get(req.params.id);
+  if (!w || w.status !== 'pending') return res.status(400).json({ error: 'Not pending.' });
+  db.transaction(() => {
+    db.prepare("UPDATE withdrawals SET status='rejected', note=? WHERE id=?").run(String((req.body || {}).note || 'Rejected by the owner').slice(0, 200), w.id);
+    payments.credit(w.user_id, w.amount, w.currency, 'refund', 'wd' + w.id, 'Withdrawal rejected');
+  })();
+  notify(w.user_id, 'withdrawal', 'Your withdrawal was rejected and the money returned to your wallet.', '/wallet');
+  audit(req, 'withdrawal-rejected', '#' + w.id);
+  res.json({ ok: true });
+});
+
+// ---------- Payment providers, receiving accounts, exchange rates ----------
+router.get('/payments/status', requirePerm('settings_payments', 'payments_view'), (req, res) => {
+  const b = base(req);
+  res.json({ providers: Object.values(providers.all).map(p => ({ id: p.id, label: p.label, enabled: p.enabled(), webhook: p.manual ? null : b + '/api/pay/webhook/' + p.id })),
+    platforms: require('../dropship').describe().map(p => ({ id: p.id, label: p.label, enabled: p.enabled, webhook: b + '/api/pod/webhook/' + p.id + '/(secret)' })), public_https: /^https:\/\//.test(process.env.SITE_URL || '') });
+});
+
+router.get('/receiving-accounts', requirePerm('settings_payments'), (req, res) => res.json(db.prepare('SELECT * FROM receiving_accounts ORDER BY id DESC').all()));
+router.post('/receiving-accounts', requirePerm('settings_payments'), (req, res) => {
+  const b = req.body || {};
+  const type = b.type === 'crypto' ? 'crypto' : 'bank';
+  const cur = String(b.currency || '').toUpperCase();
+  if (type === 'bank' && !world.isCurrency(cur)) return res.status(400).json({ error: 'Choose the currency this account receives (for example KWD).' });
+  if (type === 'bank' && (!b.bank_name || !b.account_number || !b.account_name)) return res.status(400).json({ error: 'Bank name, account number and account name are required.' });
+  if (type === 'crypto' && (!b.coin || !b.address)) return res.status(400).json({ error: 'Coin and wallet address are required.' });
+  const t = (v, n) => String(v || '').trim().slice(0, n) || null;
+  const info = db.prepare(`INSERT INTO receiving_accounts(type,label,currency,country,bank_name,account_number,account_name,swift_bic,routing,coin,network,address,memo,instructions)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(type, t(b.label, 60), type === 'bank' ? cur : (cur || null), t(b.country, 2) && String(b.country).toUpperCase(), t(b.bank_name, 100), t(b.account_number, 60), t(b.account_name, 100),
+    t(b.swift_bic, 11) && String(b.swift_bic).toUpperCase(), t(b.routing, 30), t(b.coin, 12) && String(b.coin).toUpperCase(), t(b.network, 30), t(b.address, 200), t(b.memo, 60), t(b.instructions, 500));
+  audit(req, 'receiving-account-add', type + ' ' + (cur || b.coin));
+  res.json({ ok: true, id: info.lastInsertRowid });
+});
+router.put('/receiving-accounts/:id', requirePerm('settings_payments'), (req, res) => {
+  db.prepare('UPDATE receiving_accounts SET active=? WHERE id=?').run((req.body || {}).active ? 1 : 0, req.params.id);
+  audit(req, 'receiving-account-toggle', '#' + req.params.id);
+  res.json({ ok: true });
+});
+router.delete('/receiving-accounts/:id', requirePerm('settings_payments'), (req, res) => {
+  db.prepare('DELETE FROM receiving_accounts WHERE id=?').run(req.params.id);
+  audit(req, 'receiving-account-delete', '#' + req.params.id);
+  res.json({ ok: true });
+});
+
+router.get('/fx', requirePerm('settings_payments', 'fees'), (req, res) => res.json({ margin: fx.marginPercent(), rates: db.prepare('SELECT currency,per_usd,source,updated_at FROM fx_rates ORDER BY currency').all() }));
+router.post('/fx/refresh', requirePerm('settings_payments'), async (req, res) => {
+  try { res.json(await fx.refresh(true)); } catch (e) { res.status(502).json({ error: 'Could not reach the exchange-rate feed: ' + e.message }); }
+});
+router.put('/fx/:cur', requirePerm('settings_payments'), (req, res) => {
+  try {
+    if ((req.body || {}).auto) fx.clearManual(req.params.cur); else fx.setManual(req.params.cur, (req.body || {}).per_usd);
+    audit(req, 'fx', req.params.cur + ' ' + JSON.stringify(req.body || {}));
+    res.json({ ok: true });
+  } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
+});
+
+// ---------- Fees the owner charges (class hosting, creator subscription) ----------
+router.get('/invoices', requirePerm('payments_view', 'fees'), (req, res) => {
+  res.json(db.prepare(`SELECT i.*, u.username FROM owner_invoices i JOIN users u ON u.id=i.user_id ORDER BY i.status='due' DESC, i.id DESC LIMIT 300`).all());
+});
+router.post('/invoices', requirePerm('fees', 'payments_manage'), (req, res) => {
+  const b = req.body || {};
+  const u = db.prepare('SELECT id,username FROM users WHERE lower(username)=?').get(String(b.username || '').replace(/^@/, '').toLowerCase());
+  const cur = String(b.currency || getSetting('default_currency')).toUpperCase();
+  const amount = world.toMinor(b.amount, cur);
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  if (amount <= 0 || !world.isCurrency(cur)) return res.status(400).json({ error: 'Enter an amount and currency.' });
+  const id = ownerfees.createInvoice({ userId: u.id, kind: b.kind === 'class_fee' ? 'class_fee' : 'creator_fee', amount, currency: cur, graceDays: Math.max(0, parseInt(b.grace_days, 10) || 7), note: String(b.note || 'Platform fee').slice(0, 200) });
+  audit(req, 'invoice-create', '@' + u.username + ' ' + world.format(amount, cur));
+  res.json({ ok: true, id });
+});
+router.post('/invoices/:id/:action(waive|void)', requirePerm('fees', 'payments_manage'), (req, res) => {
+  const inv = db.prepare("SELECT * FROM owner_invoices WHERE id=? AND status='due'").get(req.params.id);
+  if (!inv) return res.status(404).json({ error: 'No open invoice.' });
+  db.prepare('UPDATE owner_invoices SET status=? WHERE id=?').run(req.params.action === 'waive' ? 'waived' : 'void', inv.id);
+  notify(inv.user_id, 'payment', 'A platform payment of ' + world.format(inv.amount, inv.currency) + ' was ' + (req.params.action === 'waive' ? 'waived' : 'cancelled') + '.', '/creator/fees');
+  audit(req, 'invoice-' + req.params.action, '#' + inv.id);
+  res.json({ ok: true });
+});
+
+// =====================================================================================
+// Announcements, ads, write-ups, custom pages, categories, feature switches
+// =====================================================================================
+router.get('/announce/segments', requirePerm('announcements'), (req, res) => res.json(Object.entries(announce.SEGMENTS).map(([k, v]) => ({ key: k, label: v.label }))));
+router.get('/announce/count', requirePerm('announcements'), (req, res) => res.json({ count: announce.audienceCount(String(req.query.audience || 'all'), String(req.query.value || '')) }));
+router.get('/announcements', requirePerm('announcements'), (req, res) => res.json(db.prepare('SELECT * FROM announcements ORDER BY id DESC LIMIT 100').all()));
+router.post('/announcements', requirePerm('announcements'), async (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || '').trim().slice(0, 120);
+  if (!title) return res.status(400).json({ error: 'Write a title.' });
+  const audience = ['all', 'users', 'segment'].includes(b.audience) ? b.audience : 'all';
+  const value = String(b.audience_value || '').slice(0, 2000);
+  const link = b.link ? (String(b.link).startsWith('/') && !String(b.link).startsWith('//') ? String(b.link).slice(0, 300) : safeUrl(b.link)) : null;
+  const info = db.prepare(`INSERT INTO announcements(title,body,style,audience,audience_value,guests,starts_at,ends_at,dismissible,link,created_by)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(title, String(b.body || '').slice(0, 2000), ['info', 'success', 'warning'].includes(b.style) ? b.style : 'info', audience, value,
+    audience === 'all' && b.guests ? 1 : 0, b.starts_at || null, b.ends_at || null, b.dismissible === false ? 0 : 1, link, req.user.id);
+  let sent = 0;
+  if (b.notify !== false) sent = await announce.fanOut({ audience, audience_value: value, link }, title + (b.body ? ' - ' + String(b.body).slice(0, 120) : ''));
+  audit(req, 'announcement', title + ' -> ' + audience + (value ? ':' + value.slice(0, 60) : '') + ' (' + sent + ')');
+  res.json({ ok: true, id: info.lastInsertRowid, notified: sent });
+});
+router.put('/announcements/:id', requirePerm('announcements'), (req, res) => {
+  db.prepare('UPDATE announcements SET active=? WHERE id=?').run((req.body || {}).active ? 1 : 0, req.params.id);
+  res.json({ ok: true });
+});
+router.delete('/announcements/:id', requirePerm('announcements'), (req, res) => {
+  db.prepare('DELETE FROM announcements WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+router.get('/ads', requirePerm('ads'), (req, res) => {
+  res.json(db.prepare(`SELECT a.*, u.username FROM ads a LEFT JOIN users u ON u.id=a.owner_id ORDER BY a.status='pending' DESC, a.id DESC LIMIT 200`).all());
+});
+router.post('/ads', requirePerm('ads'), (req, res) => { // the owner's own ads: free, instant, any placement
+  const b = req.body || {};
+  const url = safeUrl(b.link_url);
+  if (!b.title || !url) return res.status(400).json({ error: 'Add a title and a link.' });
+  const days = Math.min(365, Math.max(1, parseInt(b.days, 10) || 30));
+  const media = /^\/uploads\/[\w.-]+$/.test(b.media || '') ? b.media : null;
+  const info = db.prepare("INSERT INTO ads(owner_id,title,body,media,media_kind,link_url,cta,placement,countries,status,days,starts_at,ends_at) VALUES(?,?,?,?,?,?,?,?,?, 'active', ?, datetime('now'), datetime('now', ?))")
+    .run(req.user.id, String(b.title).slice(0, 80), String(b.body || '').slice(0, 300), media, media ? (/\.(mp4|webm)$/i.test(media) ? 'video' : 'image') : null, url, String(b.cta || 'Learn more').slice(0, 24),
+      ['feed', 'reels', 'sidebar', 'banner'].includes(b.placement) ? b.placement : 'feed', String(b.countries || '').toUpperCase().replace(/[^A-Z,]/g, '').slice(0, 200), days, '+' + days + ' days');
+  audit(req, 'ad-create', String(b.title).slice(0, 60));
+  res.json({ ok: true, id: info.lastInsertRowid });
+});
+router.post('/ads/:id/approve', requirePerm('ads'), (req, res) => {
+  const a = db.prepare("SELECT * FROM ads WHERE id=? AND status='pending'").get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'Nothing to approve.' });
+  require('./ads').activate(a.id);
+  audit(req, 'ad-approve', '#' + a.id);
+  res.json({ ok: true });
+});
+router.post('/ads/:id/reject', requirePerm('ads'), (req, res) => {
+  const a = db.prepare("SELECT * FROM ads WHERE id=? AND status IN ('pending','active')").get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'Nothing to reject.' });
+  require('./ads').refund(a.id, String((req.body || {}).reason || 'Not approved').slice(0, 200));
+  audit(req, 'ad-reject', '#' + a.id);
+  res.json({ ok: true });
+});
+router.post('/ads/:id/pause', requirePerm('ads'), (req, res) => {
+  db.prepare("UPDATE ads SET status=CASE status WHEN 'active' THEN 'paused' WHEN 'paused' THEN 'active' ELSE status END WHERE id=?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+router.get('/writeups', requirePerm('writeups'), (req, res) => res.json(db.prepare('SELECT * FROM writeups ORDER BY placement, sort, id').all()));
+router.post('/writeups', requirePerm('writeups'), (req, res) => {
+  const b = req.body || {};
+  if (!String(b.title || '').trim()) return res.status(400).json({ error: 'Add a title.' });
+  const info = db.prepare('INSERT INTO writeups(title,body,placement,audience,sort,active) VALUES(?,?,?,?,?,?)')
+    .run(String(b.title).slice(0, 120), sanitizeHtml(b.body), String(b.placement || 'home_top').replace(/[^a-z_]/g, '').slice(0, 30), ['all', 'guests', 'members'].includes(b.audience) ? b.audience : 'all', parseInt(b.sort, 10) || 0, b.active === false ? 0 : 1);
+  audit(req, 'writeup-add', String(b.title).slice(0, 60));
+  res.json({ ok: true, id: info.lastInsertRowid });
+});
+router.put('/writeups/:id', requirePerm('writeups'), (req, res) => {
+  const b = req.body || {};
+  db.prepare('UPDATE writeups SET title=COALESCE(?,title), body=COALESCE(?,body), placement=COALESCE(?,placement), audience=COALESCE(?,audience), sort=COALESCE(?,sort), active=COALESCE(?,active) WHERE id=?')
+    .run(b.title ? String(b.title).slice(0, 120) : null, b.body != null ? sanitizeHtml(b.body) : null, b.placement ? String(b.placement).replace(/[^a-z_]/g, '').slice(0, 30) : null,
+      ['all', 'guests', 'members'].includes(b.audience) ? b.audience : null, b.sort != null ? parseInt(b.sort, 10) || 0 : null, b.active != null ? (b.active ? 1 : 0) : null, req.params.id);
+  audit(req, 'writeup-edit', '#' + req.params.id);
+  res.json({ ok: true });
+});
+router.delete('/writeups/:id', requirePerm('writeups'), (req, res) => {
+  db.prepare('DELETE FROM writeups WHERE id=?').run(req.params.id);
+  audit(req, 'writeup-delete', '#' + req.params.id);
+  res.json({ ok: true });
+});
+
+router.get('/custom-pages', requirePerm('writeups', 'site'), (req, res) => res.json(db.prepare('SELECT * FROM custom_pages ORDER BY id DESC').all()));
+router.post('/custom-pages', requirePerm('writeups', 'site'), (req, res) => {
+  const { title, content, in_menu } = req.body || {};
+  if (!title) return res.status(400).json({ error: 'Title required.' });
+  let slug = slugify(title), n = 1;
+  while (db.prepare('SELECT 1 FROM custom_pages WHERE slug=?').get(slug)) slug = slugify(title) + '-' + (++n);
+  db.prepare('INSERT INTO custom_pages(slug,title,content,in_menu) VALUES(?,?,?,?)').run(slug, String(title).slice(0, 100), sanitizeHtml(content), in_menu ? 1 : 0);
+  audit(req, 'add-custom-page', slug);
+  res.json({ ok: true, slug });
+});
+router.put('/custom-pages/:id', requirePerm('writeups', 'site'), (req, res) => {
+  const { title, content, in_menu, enabled } = req.body || {};
+  db.prepare('UPDATE custom_pages SET title=COALESCE(?,title), content=COALESCE(?,content), in_menu=COALESCE(?,in_menu), enabled=COALESCE(?,enabled) WHERE id=?')
+    .run(title ? String(title).slice(0, 100) : null, content != null ? sanitizeHtml(content) : null, in_menu != null ? (in_menu ? 1 : 0) : null, enabled != null ? (enabled ? 1 : 0) : null, req.params.id);
+  audit(req, 'edit-custom-page', '#' + req.params.id);
+  res.json({ ok: true });
+});
+router.delete('/custom-pages/:id', requirePerm('writeups', 'site'), (req, res) => {
+  db.prepare('DELETE FROM custom_pages WHERE id=?').run(req.params.id);
+  audit(req, 'delete-custom-page', '#' + req.params.id);
+  res.json({ ok: true });
+});
+
+router.get('/categories', requirePerm('site', 'content'), (req, res) => res.json(db.prepare('SELECT * FROM categories ORDER BY name').all()));
+router.post('/categories', requirePerm('site'), (req, res) => {
+  const name = String((req.body || {}).name || '').trim().slice(0, 40);
+  if (!name) return res.status(400).json({ error: 'Name required.' });
+  db.prepare('INSERT OR IGNORE INTO categories(name) VALUES(?)').run(name);
+  audit(req, 'add-category', name);
+  res.json({ ok: true });
+});
+router.put('/categories/:id', requirePerm('site'), (req, res) => {
+  db.prepare('UPDATE categories SET enabled=? WHERE id=?').run((req.body || {}).enabled ? 1 : 0, req.params.id);
+  res.json({ ok: true });
+});
+router.delete('/categories/:id', requirePerm('site'), (req, res) => {
+  db.prepare('DELETE FROM categories WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+router.get('/flags', requirePerm('site'), (req, res) => res.json(db.prepare('SELECT * FROM feature_flags').all()));
+router.put('/flags/:key', requirePerm('site'), (req, res) => {
+  db.prepare('UPDATE feature_flags SET enabled=? WHERE key=?').run((req.body || {}).enabled ? 1 : 0, req.params.key);
+  audit(req, 'flag', req.params.key + '=' + !!(req.body || {}).enabled);
+  res.json({ ok: true });
+});
+
+// =====================================================================================
+// AI assistant providers (keys are stored encrypted and never sent back)
+// =====================================================================================
+router.get('/ai', requirePerm('ai'), (req, res) => {
+  res.json({ types: ai.TYPES, ready: ai.ready(), providers: db.prepare('SELECT id,name,type,base_url,model,priority,enabled,api_key IS NOT NULL AND api_key!=\'\' AS has_key FROM ai_providers ORDER BY priority,id').all() });
+});
+router.post('/ai', requirePerm('ai'), async (req, res) => {
+  const b = req.body || {};
+  if (!ai.TYPES[b.type]) return res.status(400).json({ error: 'Choose a provider type.' });
+  if (!b.model || !b.api_key) return res.status(400).json({ error: 'Model and API key are required.' });
+  let baseUrl = null;
+  if (b.type === 'openai') {
+    try { baseUrl = (await assertPublicUrl(b.base_url || 'https://api.openai.com/v1')).toString().replace(/\/+$/, ''); } catch (e) { return res.status(400).json({ error: e.message }); }
+  }
+  const info = db.prepare('INSERT INTO ai_providers(name,type,base_url,api_key,model,priority,enabled) VALUES(?,?,?,?,?,?,1)')
+    .run(String(b.name || ai.TYPES[b.type].label).slice(0, 60), b.type, baseUrl, secrets.encrypt(String(b.api_key).trim()), String(b.model).slice(0, 80), parseInt(b.priority, 10) || 10);
+  audit(req, 'ai-add', b.type + ' ' + b.model);
+  res.json({ ok: true, id: info.lastInsertRowid });
+});
+router.put('/ai/:id', requirePerm('ai'), (req, res) => {
+  const b = req.body || {};
+  db.prepare('UPDATE ai_providers SET enabled=COALESCE(?,enabled), priority=COALESCE(?,priority), model=COALESCE(?,model) WHERE id=?')
+    .run(b.enabled != null ? (b.enabled ? 1 : 0) : null, b.priority != null ? parseInt(b.priority, 10) || 10 : null, b.model ? String(b.model).slice(0, 80) : null, req.params.id);
+  if (b.api_key && b.api_key !== MASK) db.prepare('UPDATE ai_providers SET api_key=? WHERE id=?').run(secrets.encrypt(String(b.api_key).trim()), req.params.id);
+  audit(req, 'ai-edit', '#' + req.params.id);
+  res.json({ ok: true });
+});
+router.delete('/ai/:id', requirePerm('ai'), (req, res) => {
+  db.prepare('DELETE FROM ai_providers WHERE id=?').run(req.params.id);
+  audit(req, 'ai-delete', '#' + req.params.id);
+  res.json({ ok: true });
+});
+router.post('/ai/test', requirePerm('ai'), async (req, res) => {
+  try { const r = await ai.ask([{ role: 'user', content: 'Reply with the single word: ready' }]); res.json({ ok: true, reply: r.reply.slice(0, 80), provider: r.provider }); }
+  catch (e) { res.status(e.status || 502).json({ error: e.message }); }
+});
+
+// =====================================================================================
+// Dropshipping oversight (Printful orders and, if switched on, user suppliers)
+// =====================================================================================
+router.get('/dropship/orders', requirePerm('dropship'), (req, res) => {
+  const st = String(req.query.status || '');
+  res.json(db.prepare(`SELECT o.id,o.ref,o.provider,o.status,o.total,o.capital,o.currency,o.country,o.customer_name,o.note,o.provider_order_id,o.tracking_number,o.settled,o.attempts,o.created_at,
+      s.brand_name, COALESCE(p.title, pl.title) AS product FROM dropship_orders o JOIN stores s ON s.id=o.store_id LEFT JOIN supplier_products p ON p.id=o.product_id LEFT JOIN pf_listings pl ON pl.id=o.pf_listing_id
+      WHERE o.status!='awaiting_payment' ${st ? 'AND o.status=?' : ''} ORDER BY o.status IN ('needs_attention','refund_needed','awaiting_supplier') DESC, o.id DESC LIMIT 200`).all(...(st ? [st] : [])));
+});
+router.post('/dropship/orders/:id/approve', requirePerm('dropship'), async (req, res) => {
+  try { await require('./pod').approve(req.params.id); audit(req, 'dropship-approve', '#' + req.params.id); res.json({ ok: true }); }
+  catch (e) { res.status(e.status || 502).json({ error: e.message }); }
+});
+router.post('/dropship/orders/:id/retry', requirePerm('dropship'), async (req, res) => {
+  const o = db.prepare("SELECT * FROM dropship_orders WHERE id=? AND status IN ('needs_attention','awaiting_supplier','paid')").get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order cannot be retried.' });
+  db.prepare("UPDATE dropship_orders SET attempts=0, last_attempt=NULL, status='paid' WHERE id=?").run(o.id);
+  await require('./pod').retryPending();
+  audit(req, 'dropship-retry', o.ref);
+  res.json({ ok: true });
+});
+router.post('/dropship/orders/:id/refunded', requirePerm('payments_manage'), (req, res) => { // after refunding the customer in the payment provider's dashboard
+  const o = db.prepare("SELECT * FROM dropship_orders WHERE id=? AND status='refund_needed'").get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Nothing to mark.' });
+  db.prepare("UPDATE dropship_orders SET status='refunded', updated_at=CURRENT_TIMESTAMP WHERE id=?").run(o.id);
+  audit(req, 'dropship-refunded', o.ref);
+  res.json({ ok: true });
+});
+router.post('/dropship/orders/:id/cancel', requirePerm('dropship'), async (req, res) => {
+  const o = db.prepare("SELECT * FROM dropship_orders WHERE id=? AND provider='printful' AND status IN ('needs_attention','awaiting_supplier','paid','processing')").get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Order cannot be cancelled.' });
+  try {
+    if (o.provider_order_id) await require('../printful').cancelOrder(o.provider_order_id);
+    require('./pod').failOrder(o, 'Cancelled by the owner');
+    audit(req, 'dropship-cancel', o.ref);
+    res.json({ ok: true });
+  } catch (e) { res.status(e.status || 502).json({ error: 'Printful would not cancel it: ' + e.message }); }
+});
+router.post('/dropship/connect/:provider', owner, async (req, res) => {
+  try {
+    const a = require('../dropship').get(req.params.provider);
+    if (!a) return res.status(404).json({ error: 'Unknown platform.' });
+    if (!a.enabled()) return res.status(400).json({ error: 'Save the ' + a.label + ' key and switch it on first.' });
+    if (!a.setupWebhooks) return res.json({ ok: true, note: a.label + ' has no webhooks; orders are checked every few minutes automatically.' });
+    if (!/^https:\/\//.test(process.env.SITE_URL || '')) return res.status(400).json({ error: 'Set SITE_URL to your public https address first; the platform must be able to reach it.' });
+    const url = await require('./pod').connectWebhooks(a.id, process.env.SITE_URL);
+    audit(req, 'dropship-connect', a.id + ' ' + url);
+    res.json({ ok: true, webhook: url });
+  } catch (e) { res.status(e.status || 502).json({ error: e.message }); }
+});
+router.get('/dropship/platforms', requirePerm('dropship'), (req, res) => res.json(require('../dropship').describe()));
+router.get('/stores', requirePerm('dropship', 'content'), (req, res) => {
+  res.json(db.prepare(`SELECT s.id,s.slug,s.brand_name,s.active,s.created_at,u.username,(SELECT COUNT(*) FROM pf_listings WHERE store_id=s.id AND active=1) AS products FROM stores s JOIN users u ON u.id=s.owner_id ORDER BY s.id DESC LIMIT 200`).all());
+});
+router.put('/stores/:id', requirePerm('dropship', 'content'), (req, res) => {
+  db.prepare('UPDATE stores SET active=? WHERE id=?').run((req.body || {}).active ? 1 : 0, req.params.id);
+  audit(req, 'store-toggle', '#' + req.params.id);
+  res.json({ ok: true });
+});
+
+// =====================================================================================
+// Audit log, database browser, backups
+// =====================================================================================
+router.get('/audit', requirePerm('audit'), (req, res) => {
+  res.json(db.prepare('SELECT a.*, u.username FROM audit_log a LEFT JOIN users u ON u.id=a.admin_id ORDER BY a.id DESC LIMIT 300').all());
+});
+
+const HIDDEN_COLS = /password_hash|api_key|^value$|token|secret|proof|private|bank_snapshot|account_number|^address$/i;
+const tableNames = () => db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(t => t.name);
+const SENSITIVE_TABLES = new Set(['settings', 'password_resets', 'push_subscriptions', 'ai_providers']);
+router.get('/db/tables', requirePerm('db_read'), (req, res) => {
+  res.json(tableNames().map(n => ({ name: n, rows: db.prepare(`SELECT COUNT(*) c FROM "${n}"`).get().c, restricted: SENSITIVE_TABLES.has(n) && req.user.role !== 'admin' })));
+});
+router.get('/db/table/:name', requirePerm('db_read'), (req, res) => {
+  const name = req.params.name;
+  if (!tableNames().includes(name)) return res.status(404).json({ error: 'No such table.' });
+  if (SENSITIVE_TABLES.has(name) && req.user.role !== 'admin') return res.status(403).json({ error: 'Only the owner can open this table.' });
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  const cols = db.prepare(`PRAGMA table_info("${name}")`).all().map(c => ({ name: c.name, pk: c.pk }));
+  const rows = db.prepare(`SELECT rowid AS _rowid_, * FROM "${name}" ORDER BY rowid DESC LIMIT 50 OFFSET ?`).all(offset);
+  const hide = !(req.user.role === 'admin' && req.query.reveal === '1') && true;
+  const priv = hasPerm(req.user, 'users_private');
+  rows.forEach(r => Object.keys(r).forEach(k => {
+    if (hide && HIDDEN_COLS.test(k)) r[k] = '[hidden]';
+    else if (!priv && name === 'users' && /^(email|phone|dob)$/.test(k)) r[k] = '[hidden]';
   }));
-  const call = async (fn, ok) => { try { const r = await fn(); if (ok) DE.toast(ok); return r; } catch (e) { DE.fail(e); return null; } };
-
-  // ------------------------------------------------------------ login
-  function loginScreen(msg) {
-    $('#app').innerHTML = '<div class="card" style="max-width:400px;margin:12vh auto"><h1>Control dashboard</h1><p class="muted">' + esc(msg || 'Sign in with your owner or admin account.') + '</p><form id="lf"><label class="f">Email, phone or username</label><input class="i" id="id" autocomplete="username" required>' + DE.pwField('pw', 'Password') + '<div class="err" id="err"></div><button class="btn primary block" style="margin-top:14px">Sign in</button></form></div>';
-    $('#lf').onsubmit = async e => { e.preventDefault(); try { await DE.post('/auth/login', { identifier: $('#id').value, password: $('#pw').value }); boot(); } catch (ex) { $('#err').textContent = ex.message; } };
-  }
-
-  // ------------------------------------------------------------ sections
-  const SECTIONS = [
-    ['overview', '📊', 'Overview', null],
-    ['users', '👥', 'Users', 'users_view'],
-    ['countries', '🌍', 'Countries', 'users_view'],
-    ['team', '🛡️', 'Admin team', 'owner'],
-    ['payments', '💳', 'Payments', 'payments_view'],
-    ['providers', '🔌', 'Payment providers', 'settings_payments'],
-    ['accounts', '🏦', 'My receiving accounts', 'settings_payments'],
-    ['fx', '💱', 'Exchange rates', 'settings_payments'],
-    ['fees', '🧾', 'Fees & invoices', 'fees'],
-    ['dropship', '📦', 'Dropshipping', 'dropship'],
-    ['content', '🗂️', 'Content', 'content'],
-    ['reports', '🚩', 'Reports', 'reports'],
-    ['announce', '📣', 'Announcements', 'announcements'],
-    ['ads', '📢', 'Ads', 'ads'],
-    ['writeups', '✍️', 'Write-ups & pages', 'writeups'],
-    ['site', '🎨', 'Site & features', 'site'],
-    ['ai', '🤖', 'AI tutor', 'ai'],
-    ['settings', '⚙️', 'All settings', 'any'],
-    ['db', '🗄️', 'Database', 'db_read'],
-    ['backups', '💾', 'Backups', 'owner'],
-    ['audit', '📜', 'Audit log', 'audit']
-  ];
-  const visible = s => s[3] === 'owner' ? ME.owner : s[3] === 'any' ? true : can(s[3]);
-
-  function frame() {
-    $('#app').innerHTML = '<div class="admtop"><button class="btn" id="burger">☰</button><b>Control dashboard</b></div><div class="adm"><nav id="nav"><div class="brand row"><img src="/logo.svg" alt="" height="30"><b>Control</b></div>' +
-      SECTIONS.filter(visible).map(s => '<a data-s="' + s[0] + '" class="' + (s[0] === SECTION ? 'on' : '') + '"><span>' + s[1] + '</span>' + s[2] + '</a>').join('') +
-      '<div class="sep" style="margin:10px 0;border-top:1px solid var(--line)"></div><a href="/">↩ Back to the site</a><a id="out">Sign out</a><div class="muted small" style="padding:8px 12px">@' + esc(ME.username) + ' · ' + (ME.owner ? 'Owner' : 'Admin') + '</div></nav><main id="main"></main></div>';
-    $$('#nav [data-s]').forEach(a => a.onclick = () => { SECTION = a.dataset.s; location.hash = SECTION; $('#nav').classList.remove('open'); frame(); load(); });
-    $('#burger').onclick = () => $('#nav').classList.toggle('open');
-    $('#out').onclick = async () => { await DE.post('/auth/logout').catch(() => {}); location.reload(); };
-  }
-  async function load() {
-    const main = $('#main'); main.innerHTML = '<div class="spinner"></div>';
-    try { await R[SECTION](main); } catch (e) { main.innerHTML = '<div class="card"><h2>Could not load</h2><p>' + esc(e.message) + '</p></div>'; }
-  }
-  const reload = () => load();
-
-  const R = {};
-
-  // ---------- overview
-  R.overview = async m => {
-    const s = await DE.get(A('/stats'));
-    const k = (l, v, sub) => '<div class="stat"><div class="muted small">' + l + '</div><div class="bal">' + v + '</div>' + (sub ? '<div class="muted small">' + sub + '</div>' : '') + '</div>';
-    m.innerHTML = '<h1>Overview</h1><div class="kv">' + k('Users', s.users, s.new_week + ' new this week') + k('Online now', s.online_now) + k('Creators', s.creators) + k('Posts', s.posts, s.reels + ' reels') + k('Communities', s.groups) + k('Classes', s.classes) + k('Stores', s.stores) +
-      k('Open reports', s.open_reports) + k('Dropship needing attention', s.dropship_attention) + (s.gross_volume ? k('Paid orders', s.orders_paid) : '') + '</div>' +
-      (s.gross_volume ? card('Money received (all time)', s.gross_volume.map(g => '<span class="pill">' + DE.money(g.total, g.currency) + '</span> ').join('') || '<span class="muted">Nothing yet</span>') : '') +
-      (s.pending_withdrawals != null ? card('Waiting for you', '<p>Withdrawals to pay: <b>' + s.pending_withdrawals + '</b> · Manual payments to confirm: <b>' + (s.pending_manual || 0) + '</b></p>') : '');
-  };
-
-  // ---------- users
-  R.users = async m => {
-    const q = DE.store.get('adm_uq') || '', cc = DE.store.get('adm_cc') || '';
-    const rows = await DE.get(A('/users?q=' + encodeURIComponent(q) + (cc ? '&country=' + cc : '')));
-    const priv = rows.length && 'email' in rows[0];
-    m.innerHTML = '<div class="row between wrap"><h1>Users</h1>' + (can('users_private') ? '<a class="btn" href="/api/admin/users/export.csv">Download CSV</a>' : '') + '</div><div class="row wrap"><input class="i grow" id="uq" placeholder="Search name, username' + (priv ? ', email, phone' : '') + '" value="' + esc(q) + '"><div style="min-width:220px">' + DE.countrySelect('ucc', cc, true) + '</div><button class="btn primary" id="go">Search</button></div>' +
-      '<div class="card">' + T(rows, [['username', 'User', r => '<a href="#" data-u="' + r.id + '">@' + esc(r.username) + '</a>' + (r.role !== 'user' ? ' ' + pill(r.role) : '')], ['display_name', 'Name'], ...(priv ? [['email', 'Email'], ['phone', 'Phone'], ['dob', 'Born']] : []), ['country', 'Country', r => esc(r.country || r.last_country || r.signup_country || '')], ['status', 'Status', r => pill(r.status, r.status === 'active' ? 'ok' : 'bad') + (r.favoured ? ' ⭐' : '') + (r.restrictions ? ' 🚧' : '')], ['posts', 'Posts'], ['last_seen', 'Last seen', r => when(r.last_seen)]]) + '</div>';
-    $('#go').onclick = () => { DE.store.set('adm_uq', $('#uq').value); DE.store.set('adm_cc', $('#ucc').value); reload(); };
-    $('#uq').onkeydown = e => e.key === 'Enter' && $('#go').click();
-    $$('[data-u]', m).forEach(a => a.onclick = e => { e.preventDefault(); userDetail(a.dataset.u); });
-  };
-  const RESTR = { post: 'Post', comment: 'Comment', chat: 'Chat', follow: 'Follow', sell: 'Sell / stores', withdraw: 'Withdraw money', community: 'Create communities', page: 'Create pages', class: 'Host classes', ai: 'Use AI', ads: 'Run ads' };
-  async function userDetail(id) {
-    const u = await DE.get(A('/users/' + id));
-    const rs = (u.restrictions || '').split(',').filter(Boolean);
-    DE.modal('<h2>@' + esc(u.username) + ' ' + (u.role !== 'user' ? pill(u.role) : '') + '</h2><div class="muted small">' + esc(u.display_name || '') + ' · joined ' + when(u.created_at) + ' · last seen ' + when(u.last_seen) + '</div>' +
-      (u.email !== undefined ? '<div class="card flat small"><b>Private details</b><br>Email: ' + esc(u.email || '—') + '<br>Phone: ' + esc(u.phone || '—') + '<br>Born: ' + esc(u.dob || '—') + '<br>Location: ' + esc([u.city, u.region, u.country].filter(Boolean).join(', ') || '—') + '<br>Signed up from: ' + esc(u.signup_country || '—') + ' · last seen in ' + esc(u.last_country || '—') + '</div>' : '') +
-      (u.wallets ? '<div class="card flat small"><b>Wallet</b> ' + (u.wallets.map(w => DE.money(w.balance, w.currency)).join(' · ') || '—') + '</div>' : '') +
-      '<div class="row wrap"><select class="i" id="st" style="max-width:160px">' + ['active', 'suspended', 'banned'].map(s => '<option' + (u.status === s ? ' selected' : '') + '>' + s + '</option>').join('') + '</select><button class="btn" id="stb">Set status</button><label class="row"><input type="checkbox" id="fav"' + (u.favoured ? ' checked' : '') + '> ⭐ Favoured</label></div>' +
-      '<h3>Restrictions</h3><div class="permgrid">' + Object.entries(RESTR).map(([k, l]) => '<label class="row small"><input type="checkbox" data-r="' + k + '"' + (rs.includes(k) || rs.includes('all') ? ' checked' : '') + '> ' + l + '</label>').join('') + '</div><input class="i" id="rn" placeholder="Reason shown to the user" value="' + esc(u.restriction_note || '') + '"><button class="btn sm" id="rsb" style="margin-top:6px">Save restrictions</button>' +
-      (can('fees') ? '<h3>Fees</h3><label class="row"><input type="checkbox" id="wv"' + (u.owner_fee_waived ? ' checked' : '') + '> Waive all platform fees for this user</label><div class="two"><div><label class="f">Commission override %</label><input class="i" id="co" value="' + esc(u.commission_override == null ? '' : u.commission_override) + '"></div><div><label class="f">Class fee override (minor units)</label><input class="i" id="cf" value="' + esc(u.class_fee_override == null ? '' : u.class_fee_override) + '"></div></div><button class="btn sm" id="fsv" style="margin-top:6px">Save fees</button>' : '') +
-      '<h3>Actions</h3><div class="row wrap"><button class="btn" id="rl">Password reset link</button><button class="btn" id="un">Unlock login</button>' + (!u.is_creator ? '<button class="btn" id="gc">Grant creator access</button>' : '') + (can('users_delete') && u.role !== 'admin' ? '<button class="btn danger" id="del">Delete account</button>' : '') + '</div>' +
-      (u.logins ? '<h3>Recent logins</h3>' + T(u.logins, [['created_at', 'When', r => when(r.created_at)], ['ok', 'OK', r => (r.ok ? '✔' : '✖')], ['country', 'Country'], ['ua', 'Device', r => esc(String(r.ua || '').slice(0, 50))]]) : '') + '<button class="btn" data-close style="margin-top:10px">Close</button>', (mm, close) => {
-      const done = (fn, msg) => async () => { if (await call(fn, msg) !== null) { close(); reload(); } };
-      mm.querySelector('#stb').onclick = done(() => DE.post(A('/users/' + id + '/status'), { status: mm.querySelector('#st').value }), 'Status updated');
-      mm.querySelector('#fav').onchange = e => call(() => DE.put(A('/users/' + id + '/flags'), { favoured: e.target.checked }), 'Saved');
-      mm.querySelector('#rsb').onclick = done(() => DE.put(A('/users/' + id + '/flags'), { restrictions: $$('[data-r]:checked', mm).map(x => x.dataset.r), restriction_note: mm.querySelector('#rn').value }), 'Restrictions saved');
-      const fs = mm.querySelector('#fsv'); if (fs) fs.onclick = done(() => DE.put(A('/users/' + id + '/flags'), { owner_fee_waived: mm.querySelector('#wv').checked, commission_override: mm.querySelector('#co').value, class_fee_override: mm.querySelector('#cf').value }), 'Fees saved');
-      mm.querySelector('#rl').onclick = async () => { const r = await call(() => DE.post(A('/users/' + id + '/reset-link'))); if (r) DE.modal('<h2>Reset link</h2><p class="muted small">Send this to the user. It expires soon.</p><input class="i mono" readonly value="' + esc(r.url) + '"><button class="btn" data-close style="margin-top:10px">Close</button>'); };
-      mm.querySelector('#un').onclick = () => call(() => DE.post(A('/users/' + id + '/unlock')), 'Unlocked');
-      const gc = mm.querySelector('#gc'); if (gc) gc.onclick = done(() => DE.post(A('/users/' + id + '/grant-creator')), 'Creator access granted');
-      const dl = mm.querySelector('#del'); if (dl) dl.onclick = async () => { if (await DE.confirm('Permanently delete @' + u.username + ' and everything they own? This cannot be undone.', 'Delete')) { const pw = await stepUp(); if (pw === null) return; done(() => DE.api('DELETE', A('/users/' + id), { password: pw }), 'Deleted')(); } };
-    });
-  }
-
-  R.countries = async m => {
-    const rows = await DE.get(A('/users/countries'));
-    const total = rows.reduce((s, r) => s + r.users, 0) || 1;
-    m.innerHTML = '<h1>Where your users live</h1>' + card('By country', T(rows, [['country', 'Country', r => esc((DE.world.countries.find(c => c.code === r.country) || {}).name || r.country || 'Unknown')], ['users', 'Users'], ['p', 'Share', r => '<div style="background:var(--card2);border-radius:6px;width:160px"><div style="background:var(--brand);height:8px;border-radius:6px;width:' + Math.round(r.users / total * 100) + '%"></div></div> ' + Math.round(r.users / total * 100) + '%']]));
-  };
-
-  // ---------- admin team
-  R.team = async m => {
-    const t = await DE.get(A('/team'));
-    m.innerHTML = '<div class="row between wrap"><h1>Admin team</h1><button class="btn primary" id="add">+ Add an admin</button></div><p class="muted">Admins only see and do what you tick for them. Only you (the owner) can change this page, platform secrets, the database, backups, and pay your team.</p>' +
-      t.staff.map(s => '<div class="card"><div class="row wrap"><div class="grow"><b>@' + esc(s.username) + '</b> ' + pill(s.status, s.status === 'active' ? 'ok' : 'bad') + '<div class="muted small">' + esc(s.email || '') + ' · last seen ' + when(s.last_seen) + '</div></div><button class="btn sm" data-perm="' + s.id + '">Permissions</button><button class="btn sm primary" data-pay="' + s.id + '">Pay</button><button class="btn sm" data-hist="' + s.id + '">Payments</button><button class="btn sm danger" data-rm="' + s.id + '">Remove</button></div><div class="muted small" style="margin-top:6px">' + (s.permissions ? s.permissions.split(',').map(p => t.catalogue[p] ? esc(t.catalogue[p]) : '').filter(Boolean).join(' · ') : 'No permissions yet') + '</div></div>').join('') || '<div class="card empty">No admins yet.</div>';
-    const permForm = (cur) => '<div class="permgrid">' + Object.entries(t.catalogue).map(([k, l]) => '<label class="row small"><input type="checkbox" data-p="' + k + '"' + (cur.includes(k) ? ' checked' : '') + '> ' + esc(l) + '</label>').join('') + '</div>';
-    $('#add').onclick = () => DE.modal('<h2>Add an admin</h2><label class="f">Username or email of an existing user</label><input class="i" id="w"><h3>What can they do?</h3>' + permForm([]) + '<div class="err" id="e"></div><div class="row" style="margin-top:12px"><button class="btn primary" id="ok">Add admin</button><button class="btn" data-close>Cancel</button></div>', (mm, close) => { mm.querySelector('#ok').onclick = async () => { try { await DE.post(A('/team'), { who: mm.querySelector('#w').value, permissions: $$('[data-p]:checked', mm).map(x => x.dataset.p) }); close(); reload(); } catch (e) { mm.querySelector('#e').textContent = e.message; } }; });
-    $$('[data-perm]', m).forEach(b => b.onclick = () => { const s = t.staff.find(x => String(x.id) === b.dataset.perm); DE.modal('<h2>Permissions for @' + esc(s.username) + '</h2>' + permForm((s.permissions || '').split(',')) + '<div class="row" style="margin-top:12px"><button class="btn primary" id="ok">Save</button><button class="btn" data-close>Cancel</button></div>', (mm, close) => { mm.querySelector('#ok').onclick = async () => { if (await call(() => DE.put(A('/team/' + s.id), { permissions: $$('[data-p]:checked', mm).map(x => x.dataset.p) }), 'Saved') !== null) { close(); reload(); } }; }); });
-    $$('[data-rm]', m).forEach(b => b.onclick = async () => { if (await DE.confirm('Remove this admin? They keep their normal user account.', 'Remove')) { await call(() => DE.del(A('/team/' + b.dataset.rm)), 'Removed'); reload(); } });
-    $$('[data-pay]', m).forEach(b => b.onclick = async () => { const o = await ask('Pay this admin', [{ k: 'amount', label: 'Amount', type: 'number', ph: '0.00' }, { k: 'currency', label: 'Currency', type: 'select', v: DE.config.default_currency || 'USD', options: DE.world.currencies.map(c => [c.code, c.code + ' – ' + c.name]) }, { k: 'source', label: 'Pay from', type: 'select', v: 'wallet', options: [['wallet', 'My wallet (they can withdraw instantly, in any currency, to bank / fintech / PayPal / crypto)'], ['external', 'I paid them myself (just record it)']] }, { k: 'note', label: 'Note', v: 'Salary' }], 'Pay now'); if (o && await call(() => DE.post(A('/team/' + b.dataset.pay + '/pay'), o), 'Payment sent')) reload(); });
-    $$('[data-hist]', m).forEach(b => b.onclick = async () => { const r = await DE.get(A('/team/' + b.dataset.hist + '/payments')); DE.modal('<h2>Payments to this admin</h2>' + T(r, [['created_at', 'When', x => when(x.created_at)], ['amount', 'Amount', x => DE.money(x.amount, x.currency)], ['source', 'From'], ['note', 'Note']]) + '<button class="btn" data-close>Close</button>'); });
-  };
-
-  // ---------- payments
-  R.payments = async m => {
-    const [man, wd, tx] = await Promise.all([DE.get(A('/manual-payments')), DE.get(A('/withdrawals')), DE.get(A('/transactions'))]);
-    m.innerHTML = '<h1>Payments</h1>' +
-      card('Transfers waiting for you to confirm', T(man.filter(x => x.status === 'pending'), [['created_at', 'When', r => when(r.created_at)], ['username', 'User', r => '@' + esc(r.username || '')], ['amount', 'Amount', r => DE.money(r.amount, r.currency)], ['purpose', 'For'], ['proof', 'Proof', r => esc(r.proof || '')], ['x', '', r => can('payments_manage') ? '<button class="btn sm primary" data-mok="' + r.id + '">Confirm</button><button class="btn sm danger" data-mno="' + r.id + '">Reject</button>' : '']], 'None waiting.')) +
-      card('Withdrawals', T(wd, [['created_at', 'When', r => when(r.created_at)], ['username', 'User', r => '@' + esc(r.username || '')], ['amount', 'Amount', r => DE.money(r.amount, r.currency)], ['dest', 'Pay to', r => esc(r.dest || r.method || '')], ['status', 'Status', r => pill(r.status, r.status === 'paid' ? 'ok' : r.status === 'failed' || r.status === 'rejected' ? 'bad' : 'warn')], ['x', '', r => can('payments_manage') && ['pending', 'processing'].includes(r.status) ? '<button class="btn sm primary" data-wok="' + r.id + '">Mark paid</button><button class="btn sm danger" data-wno="' + r.id + '">Reject &amp; refund</button>' : '']])) +
-      card('Latest transactions', T(tx.slice(0, 100), [['created_at', 'When', r => when(r.created_at)], ['username', 'User', r => '@' + esc(r.username || '')], ['type', 'Type'], ['amount', 'Amount', r => DE.money(r.amount, r.currency)], ['note', 'Note']]));
-    $$('[data-mok]', m).forEach(b => b.onclick = async () => { if (await call(() => DE.post(A('/manual-payments/' + b.dataset.mok + '/approve')), 'Confirmed')) reload(); });
-    $$('[data-mno]', m).forEach(b => b.onclick = async () => { const o = await ask('Reject payment', [{ k: 'reason', label: 'Reason' }]); if (o && await call(() => DE.post(A('/manual-payments/' + b.dataset.mno + '/reject'), o), 'Rejected')) reload(); });
-    $$('[data-wok]', m).forEach(b => b.onclick = async () => { const o = await ask('Mark as paid', [{ k: 'reference', label: 'Transfer reference (optional)' }]); if (o && await call(() => DE.post(A('/withdrawals/' + b.dataset.wok + '/approve'), o), 'Marked paid')) reload(); });
-    $$('[data-wno]', m).forEach(b => b.onclick = async () => { const o = await ask('Reject and refund', [{ k: 'reason', label: 'Reason' }]); if (o && await call(() => DE.post(A('/withdrawals/' + b.dataset.wno + '/reject'), o), 'Refunded to wallet')) reload(); });
-  };
-
-  // ---------- providers (webhook URLs + keys)
-  const PROV_KEYS = {
-    paystack: ['paystack_enabled', 'paystack_secret_key', 'paystack_currencies'],
-    flutterwave: ['flutterwave_enabled', 'flutterwave_secret_key', 'flutterwave_secret_hash', 'flutterwave_currencies'],
-    stripe: ['stripe_enabled', 'stripe_secret_key', 'stripe_webhook_secret', 'stripe_currencies'],
-    paypal: ['paypal_mode', 'paypal_client_id', 'paypal_client_secret', 'paypal_webhook_id', 'paypal_currencies', 'paypal_payouts_enabled'],
-    tap: ['tap_secret_key', 'tap_currencies'],
-    nowpayments: ['nowpayments_api_key', 'nowpayments_ipn_secret'],
-    btcpay: ['btcpay_url', 'btcpay_api_key', 'btcpay_store_id', 'btcpay_webhook_secret', 'btcpay_payouts_enabled', 'btcpay_payout_method'],
-    wise: ['wise_env', 'wise_api_token', 'wise_profile_id', 'wise_source_currency', 'wise_payouts_enabled']
-  };
-  const HELP = {
-    paypal: 'Create a REST app at developer.paypal.com → copy Client ID and Secret. Add the webhook URL below and paste its Webhook ID. PayPal Payouts must be enabled on your business account for automatic payouts.',
-    tap: 'Tap Payments (KNET, cards, Gulf currencies — Kuwaiti dinar). Paste your Tap secret key and set the webhook (post) URL below in your Tap dashboard.',
-    wise: 'Wise Business: create an API token (full access) and paste your profile ID. This pays out Kuwaiti dinar (and many other currencies) to users\' IBANs automatically from your Wise balance.',
-    btcpay: 'Self-hosted BTCPay Server. Payouts require your store wallet to be set up with an automated payout processor.',
-    paystack: 'Naira cards/transfers and automatic Nigerian bank payouts.', flutterwave: 'Cards, mobile money and bank transfers across Africa, plus bank payouts.', stripe: 'Cards and wallets worldwide (needs a Stripe-supported business country).', nowpayments: 'Crypto checkout (BTC, USDT and many more).'
-  };
-  R.providers = async m => {
-    const [st, set] = await Promise.all([DE.get(A('/payments/status')), DE.get(A('/settings'))]);
-    m.innerHTML = '<h1>Payment providers</h1>' + (st.public_https ? '' : '<div class="card warnbox">Your SITE_URL is not a public https address, so providers cannot reach your webhooks. Set SITE_URL in .env.</div>') +
-      st.providers.filter(p => PROV_KEYS[p.id]).map(p => card(esc(p.label) + ' ' + pill(p.enabled ? 'connected' : 'not connected', p.enabled ? 'ok' : ''), '<p class="muted small">' + esc(HELP[p.id] || '') + '</p>' + (p.webhook ? '<div class="small">Webhook URL: <code class="mono">' + esc(p.webhook) + '</code></div>' : '') + settingsForm(PROV_KEYS[p.id], set, p.id))).join('') +
-      card('Wise ' + pill(set.wise_api_token ? 'token saved' : 'not connected', set.wise_api_token ? 'ok' : ''), '<p class="muted small">' + HELP.wise + '</p>' + settingsForm(PROV_KEYS.wise, set, 'wise')) +
-      card('General', settingsForm(['accepted_currencies', 'auto_payout', 'min_withdrawal', 'default_currency', 'commission_percent'], set, 'gen'));
-    bindSettings(m);
-  };
-
-  // ---------- generic settings forms
-  const LABEL = k => k.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
-  const BOOL = /(_enabled|^auto_|_on$|^allow_|^require_|^maintenance_mode$)/;
-  function settingsForm(keys, set, id) {
-    const rows = keys.filter(k => k in set).map(k => {
-      const v = set[k]; const secret = v === '********' || /(secret|api_key|api_token|_token|password|_hash)$/.test(k);
-      const long = /(_html|_text|description|footer|message)$/.test(k) || String(v).length > 90;
-      let input;
-      if (BOOL.test(k) && (v === '0' || v === '1' || v === '')) input = '<label class="row"><input type="checkbox" data-k="' + k + '"' + (v === '1' ? ' checked' : '') + '> On</label>';
-      else if (/_mode$|_env$/.test(k) && /paypal|wise/.test(k)) input = '<select class="i" data-k="' + k + '"><option' + (v === 'live' ? ' selected' : '') + '>live</option><option' + (v === 'sandbox' ? ' selected' : '') + '>sandbox</option></select>';
-      else if (long) input = '<textarea class="i" data-k="' + k + '" rows="4">' + esc(v) + '</textarea>';
-      else input = '<input class="i" data-k="' + k + '" type="' + (secret ? 'password' : 'text') + '" value="' + esc(v) + '" autocomplete="off">';
-      return '<div class="setrow"><label>' + esc(LABEL(k)) + '</label><div>' + input + '</div></div>';
-    }).join('');
-    return '<div data-sf="' + id + '">' + rows + '<button class="btn primary" data-save="' + id + '" style="margin-top:10px">Save</button></div>';
-  }
-  function bindSettings(root) {
-    $$('[data-save]', root).forEach(b => b.onclick = async () => {
-      const body = {};
-      $$('[data-k]', $('[data-sf="' + b.dataset.save + '"]', root)).forEach(e => { body[e.dataset.k] = e.type === 'checkbox' ? e.checked : e.value; });
-      const r = await call(() => DE.put(A('/settings'), body), 'Saved');
-      if (r && r.denied && r.denied.length) DE.toast('Not allowed to change: ' + r.denied.join(', '), true);
-    });
-  }
-  const settingsSection = (title, keys, extra) => async m => { const set = await DE.get(A('/settings')); m.innerHTML = '<h1>' + title + '</h1>' + (extra ? extra(set) : '') + card('Settings', settingsForm(keys.filter(k => k in set), set, 's')); bindSettings(m); };
-
-  // ---------- receiving accounts (manual transfers into your bank/crypto, incl. KWD)
-  R.accounts = async m => {
-    const rows = await DE.get(A('/receiving-accounts'));
-    m.innerHTML = '<div class="row between"><h1>My receiving accounts</h1><button class="btn primary" id="add">+ Add account</button></div><p class="muted">Shown to people who choose “bank transfer / crypto” at checkout. Add a Kuwaiti bank (KWD), a USD account, a Payoneer receiving account or a crypto address. Payments here are confirmed by you; use the automatic providers for hands-free payments.</p>' +
-      '<div class="card">' + T(rows, [['label', 'Label'], ['type', 'Type'], ['currency', 'Currency'], ['bank_name', 'Bank / coin', r => esc(r.bank_name || r.coin || '')], ['account_number', 'Account / address', r => esc(r.account_number || r.address || '')], ['active', 'Active', r => (r.active ? '✔' : '—')], ['x', '', r => '<button class="btn sm" data-ed="' + r.id + '">Edit</button><button class="btn sm danger" data-del="' + r.id + '">Delete</button>']]) + '</div>';
-    const form = async r => ask(r ? 'Edit account' : 'Add receiving account', [{ k: 'type', label: 'Type', type: 'select', v: r ? r.type : 'bank', options: [['bank', 'Bank account'], ['crypto', 'Crypto wallet']] }, { k: 'label', label: 'Label shown to payers', v: r ? r.label : '', ph: 'e.g. Kuwait bank (KWD)' }, { k: 'currency', label: 'Currency', type: 'select', v: r ? r.currency : 'KWD', options: DE.world.currencies.map(c => [c.code, c.code + ' – ' + c.name]) }, { k: 'bank_name', label: 'Bank name', v: r && r.bank_name }, { k: 'account_name', label: 'Account name', v: r && r.account_name }, { k: 'account_number', label: 'Account number / IBAN', v: r && r.account_number }, { k: 'swift_bic', label: 'SWIFT / BIC', v: r && r.swift_bic }, { k: 'country', label: 'Country code', v: r && r.country, ph: 'KW' }, { k: 'coin', label: 'Coin (crypto)', v: r && r.coin }, { k: 'network', label: 'Network (crypto)', v: r && r.network }, { k: 'address', label: 'Address (crypto)', v: r && r.address }, { k: 'memo', label: 'Memo / tag', v: r && r.memo }, { k: 'instructions', label: 'Instructions for payers', type: 'textarea', v: r && r.instructions }, { k: 'active', label: 'Active', type: 'check', v: r ? r.active : true, hint: 'Show to payers' }]);
-    $('#add').onclick = async () => { const o = await form(); if (o && await call(() => DE.post(A('/receiving-accounts'), o), 'Added')) reload(); };
-    $$('[data-ed]', m).forEach(b => b.onclick = async () => { const o = await form(rows.find(x => String(x.id) === b.dataset.ed)); if (o && await call(() => DE.put(A('/receiving-accounts/' + b.dataset.ed), o), 'Saved')) reload(); });
-    $$('[data-del]', m).forEach(b => b.onclick = async () => { if (await DE.confirm('Delete this account?', 'Delete')) { await call(() => DE.del(A('/receiving-accounts/' + b.dataset.del))); reload(); } });
-  };
-
-  // ---------- fx
-  R.fx = async m => {
-    const r = await DE.get(A('/fx'));
-    const rows = Array.isArray(r) ? r : (r.rates || []);
-    m.innerHTML = '<div class="row between"><h1>Exchange rates</h1><button class="btn" id="rf">Refresh from the internet</button></div><p class="muted">Rates are used for conversions and withdrawals (Nigerian users can convert to naira, Kuwaiti users to dinar, etc). Set your own rate to override the automatic one.</p>' +
-      '<div class="card">' + T(rows, [['currency', 'Currency'], ['per_usd', 'Per 1 USD'], ['manual', 'Source', r => (r.manual ? pill('your rate', 'warn') : pill('automatic'))], ['x', '', r => '<button class="btn sm" data-set="' + (r.currency || r.code) + '">Set</button>' + (r.manual ? '<button class="btn sm" data-auto="' + (r.currency || r.code) + '">Back to automatic</button>' : '')]]) + '</div>';
-    $('#rf').onclick = async () => { await call(() => DE.post(A('/fx/refresh')), 'Refreshed'); reload(); };
-    $$('[data-set]', m).forEach(b => b.onclick = async () => { const o = await ask('Rate for ' + b.dataset.set, [{ k: 'per_usd', label: 'How many ' + b.dataset.set + ' equal 1 USD?', type: 'number' }]); if (o && await call(() => DE.put(A('/fx/' + b.dataset.set), o), 'Saved')) reload(); });
-    $$('[data-auto]', m).forEach(b => b.onclick = async () => { await call(() => DE.put(A('/fx/' + b.dataset.auto), { auto: true })); reload(); });
-  };
-
-  // ---------- fees
-  R.fees = async m => {
-    const [inv, set] = await Promise.all([DE.get(A('/invoices')), DE.get(A('/settings'))]);
-    const feeKeys = Object.keys(set).filter(k => /^(owner_payments_enabled|pay_.*_enabled|class_fee|creator_fee|creator_|dropship_fee|commission|owner_fee|class_)/.test(k) && k !== '_perm');
-    m.innerHTML = '<div class="row between"><h1>Fees & invoices</h1>' + (can('payments_manage') ? '<button class="btn primary" id="new">+ Invoice a user</button>' : '') + '</div>' +
-      card('Fee settings', '<p class="muted small">Set what creators pay you, and when. Switch a kind of payment off, or waive it for one person from their user page.</p>' + settingsForm(feeKeys, set, 'fees')) +
-      card('Invoices', T(inv, [['id', '#'], ['username', 'User', r => '@' + esc(r.username)], ['kind', 'For'], ['amount', 'Amount', r => DE.money(r.amount, r.currency)], ['status', 'Status', r => pill(r.status, r.status === 'paid' ? 'ok' : r.status === 'due' ? 'warn' : '')], ['due_at', 'Due', r => when(r.due_at)], ['x', '', r => r.status === 'due' && can('payments_manage') ? '<button class="btn sm" data-w="' + r.id + '">Waive</button><button class="btn sm danger" data-v="' + r.id + '">Void</button>' : '']]));
-    bindSettings(m);
-    const nb = $('#new'); if (nb) nb.onclick = async () => { const o = await ask('Invoice a user', [{ k: 'username', label: 'Username' }, { k: 'amount', label: 'Amount', type: 'number' }, { k: 'currency', label: 'Currency', type: 'select', v: DE.config.default_currency || 'USD', options: DE.world.currencies.map(c => [c.code, c.code]) }, { k: 'kind', label: 'Kind', type: 'select', v: 'creator_fee', options: [['creator_fee', 'Creator fee'], ['class_fee', 'Class fee'], ['ad', 'Advert'], ['dropship_fee', 'Dropship fee']] }, { k: 'note', label: 'Note' }, { k: 'grace_days', label: 'Days to pay', type: 'number', v: 7 }], 'Create invoice'); if (o && await call(() => DE.post(A('/invoices'), o), 'Created')) reload(); };
-    $$('[data-w]', m).forEach(b => b.onclick = async () => { await call(() => DE.post(A('/invoices/' + b.dataset.w + '/waive')), 'Waived'); reload(); });
-    $$('[data-v]', m).forEach(b => b.onclick = async () => { await call(() => DE.post(A('/invoices/' + b.dataset.v + '/void')), 'Voided'); reload(); });
-  };
-
-  // ---------- dropship
-  R.dropship = async m => {
-    const [plats, ords, stores, set] = await Promise.all([DE.get(A('/dropship/platforms')), DE.get(A('/dropship/orders')), DE.get(A('/stores')), DE.get(A('/settings'))]);
-    const pk = ['printful_enabled', 'printful_api_token', 'printful_store_id', 'printful_webhook_secret', 'printify_enabled', 'printify_api_token', 'printify_shop_id', 'cj_enabled', 'cj_api_key', 'cj_origin_countries', 'dropship_auto_confirm', 'pod_default_markup', 'dropship_user_suppliers', 'store_domain'];
-    const fk = ['dropship_fee_every', 'dropship_fee_mode', 'dropship_fee_amount', 'dropship_fee_percent', 'dropship_fee_currency', 'dropship_fee_grace_days', 'pay_dropship_fee_enabled'];
-    m.innerHTML = '<h1>Dropshipping</h1>' + card('Platforms', '<p class="muted small">Connect the platforms sellers can use. Sellers choose one, or “all” and the app picks per product and country. You pay each platform for production and delivery from your account with them; customers\' payments cover it.</p>' + plats.map(p => '<div class="row wrap" style="padding:6px 0"><b class="grow">' + esc(p.label) + '</b>' + pill(p.enabled ? 'on' : 'off', p.enabled ? 'ok' : '') + (ME.owner && p.enabled ? '<button class="btn sm" data-conn="' + p.id + '">Connect webhooks</button>' : '') + '</div>').join('')) +
-      (ME.owner ? card('Platform keys & settings', settingsForm(pk, set, 'pk')) + card('Seller fee (paid to you after every N sales)', settingsForm(fk, set, 'fk')) : '') +
-      card('Orders', T(ords, [['ref', 'Order', r => '<span class="mono">' + esc(r.ref) + '</span>'], ['store', 'Store', r => esc(r.brand_name || r.store || '')], ['provider', 'Platform'], ['status', 'Status', r => pill(r.status, ['delivered', 'shipped'].includes(r.status) ? 'ok' : ['needs_attention', 'refund_needed', 'failed'].includes(r.status) ? 'bad' : 'warn')], ['total', 'Total', r => DE.money(r.total, r.currency)], ['note', 'Note', r => esc(String(r.note || '').slice(0, 80))], ['x', '', r => '<button class="btn sm" data-ap="' + r.id + '">Approve</button><button class="btn sm" data-rt="' + r.id + '">Retry</button>' + (r.status === 'refund_needed' ? '<button class="btn sm" data-rf="' + r.id + '">Mark refunded</button>' : '') + '<button class="btn sm danger" data-cn="' + r.id + '">Cancel</button>']])) +
-      card('Stores', T(stores, [['brand_name', 'Store', r => '<a href="/s/' + esc(r.slug) + '" target="_blank">' + esc(r.brand_name) + '</a>'], ['username', 'Owner', r => '@' + esc(r.username)], ['products', 'Products'], ['active', 'Open', r => (r.active ? '✔' : '✖')], ['x', '', r => '<button class="btn sm" data-tg="' + r.id + '" data-on="' + (r.active ? 0 : 1) + '">' + (r.active ? 'Close' : 'Open') + '</button>']]));
-    bindSettings(m);
-    $$('[data-conn]', m).forEach(b => b.onclick = async () => { const r = await call(() => DE.post(A('/dropship/connect/' + b.dataset.conn))); if (r) DE.toast(r.note || 'Webhooks connected'); });
-    const od = (sel, path, ok) => $$(sel, m).forEach(b => b.onclick = async () => { if (await call(() => DE.post(A('/dropship/orders/' + b.dataset[sel.slice(6, -1)] + path)), ok)) reload(); });
-    od('[data-ap]', '/approve', 'Approved'); od('[data-rt]', '/retry', 'Retrying'); od('[data-rf]', '/refunded', 'Marked refunded'); od('[data-cn]', '/cancel', 'Cancelled');
-    $$('[data-tg]', m).forEach(b => b.onclick = async () => { await call(() => DE.put(A('/stores/' + b.dataset.tg), { active: b.dataset.on === '1' })); reload(); });
-  };
-
-  // ---------- content & reports
-  R.content = async m => {
-    const kind = DE.store.get('adm_kind') || 'posts';
-    const rows = await DE.get(A('/content/' + kind));
-    m.innerHTML = '<h1>Content</h1><div class="chips">' + ['posts', 'pages', 'groups', 'products', 'classes'].map(k => '<span class="chip ' + (k === kind ? 'on' : '') + '" data-k="' + k + '">' + k + '</span>').join('') + '</div><div class="card">' + T(rows, Object.keys(rows[0] || { id: 1 }).map(k => [k, esc(k), r => esc(String(r[k] == null ? '' : r[k]).slice(0, 80))]).concat([['x', '', r => '<button class="btn sm danger" data-d="' + r.id + '">Delete</button>']])) + '</div>';
-    $$('[data-k]', m).forEach(c => c.onclick = () => { DE.store.set('adm_kind', c.dataset.k); reload(); });
-    $$('[data-d]', m).forEach(b => b.onclick = async () => { if (await DE.confirm('Delete this ' + kind.slice(0, -1) + '?', 'Delete')) { await call(() => DE.del(A('/content/' + kind + '/' + b.dataset.d)), 'Deleted'); reload(); } });
-  };
-  R.reports = async m => {
-    const rows = await DE.get(A('/reports'));
-    m.innerHTML = '<h1>Reports</h1><div class="card">' + T(rows, [['created_at', 'When', r => when(r.created_at)], ['reporter', 'By', r => '@' + esc(r.reporter || '')], ['kind', 'About', r => esc(r.kind || r.target_type || '') + ' #' + esc(r.target_id || '')], ['reason', 'Reason'], ['status', 'Status', r => pill(r.status, r.status === 'open' ? 'warn' : 'ok')], ['x', '', r => r.status === 'open' ? '<button class="btn sm" data-r="' + r.id + '">Resolve</button>' : '']], 'No reports. 🎉') + '</div>';
-    $$('[data-r]', m).forEach(b => b.onclick = async () => { await call(() => DE.post(A('/reports/' + b.dataset.r + '/resolve')), 'Resolved'); reload(); });
-  };
-
-  // ---------- announcements
-  R.announce = async m => {
-    const [list, seg] = await Promise.all([DE.get(A('/announcements')), DE.get(A('/announce/segments'))]);
-    m.innerHTML = '<div class="row between"><h1>Announcements</h1><button class="btn primary" id="new">+ New announcement</button></div><p class="muted">Send to everyone, a category of users, one country, or a single person. It shows as a banner and as a notification.</p><div class="card">' + T(list, [['created_at', 'Sent', r => when(r.created_at)], ['title', 'Title'], ['audience', 'To', r => esc(r.audience) + (r.audience_value ? ': ' + esc(r.audience_value) : '')], ['active', 'Live', r => (r.active ? '✔' : '—')], ['x', '', r => '<button class="btn sm danger" data-d="' + r.id + '">Remove</button>']]) + '</div>';
-    $('#new').onclick = async () => {
-      const o = await ask('New announcement', [{ k: 'title', label: 'Title' }, { k: 'body', label: 'Message', type: 'textarea' }, { k: 'link', label: 'Link (optional)' }, { k: 'audience', label: 'Send to', type: 'select', v: 'all', options: seg.map(s => [s.key, s.label]).concat([['user', 'One user (type the username below)']]) }, { k: 'audience_value', label: 'Country code / username / category (when needed)' }, { k: 'style', label: 'Look', type: 'select', v: 'info', options: [['info', 'Info'], ['success', 'Good news'], ['warn', 'Warning']] }, { k: 'notify', label: 'Also notify', type: 'check', v: true, hint: 'Send as a notification (and push)' }, { k: 'dismissible', label: 'Dismiss', type: 'check', v: true, hint: 'Users can dismiss the banner' }, { k: 'guests', label: 'Guests', type: 'check', v: false, hint: 'Also show to visitors who are not logged in' }], 'Send');
-      if (o) { const c = await DE.get(A('/announce/count?audience=' + o.audience + '&value=' + encodeURIComponent(o.audience_value || ''))).catch(() => ({ count: '?' })); if (await DE.confirm('This will reach ' + c.count + ' user(s). Send now?', 'Send')) { await call(() => DE.post(A('/announcements'), o), 'Sent'); reload(); } }
-    };
-    $$('[data-d]', m).forEach(b => b.onclick = async () => { await call(() => DE.del(A('/announcements/' + b.dataset.d))); reload(); });
-  };
-
-  // ---------- ads
-  R.ads = async m => {
-    const [rows, set] = await Promise.all([DE.get(A('/ads')), DE.get(A('/settings'))]);
-    m.innerHTML = '<div class="row between"><h1>Ads</h1><button class="btn primary" id="new">+ Run my own ad</button></div>' + card('Settings', '<p class="muted small">Turn advertising on or off, let users buy ads, and set the price.</p>' + settingsForm(Object.keys(set).filter(k => /^ads_/.test(k)), set, 'ads')) +
-      card('Adverts', T(rows, [['title', 'Title'], ['username', 'By', r => r.username ? '@' + esc(r.username) : 'Owner'], ['placement', 'Where'], ['status', 'Status', r => pill(r.status, r.status === 'active' ? 'ok' : r.status === 'pending' ? 'warn' : '')], ['impressions', 'Views'], ['clicks', 'Clicks'], ['x', '', r => (r.status === 'pending' ? '<button class="btn sm primary" data-ap="' + r.id + '">Approve</button><button class="btn sm danger" data-rj="' + r.id + '">Reject</button>' : '') + (r.status === 'active' ? '<button class="btn sm" data-ps="' + r.id + '">Pause</button>' : '')]]));
-    bindSettings(m);
-    $('#new').onclick = async () => { const o = await ask('New advert', [{ k: 'title', label: 'Title' }, { k: 'body', label: 'Text' }, { k: 'link_url', label: 'Link (https://)' }, { k: 'cta', label: 'Button text', v: 'Learn more' }, { k: 'placement', label: 'Where', type: 'select', v: 'feed', options: ['feed', 'sidebar', 'reels', 'home'].map(x => [x, x]) }, { k: 'days', label: 'Days', type: 'number', v: 30 }, { k: 'countries', label: 'Countries (codes, empty = all)' }], 'Publish'); if (o && await call(() => DE.post(A('/ads'), o), 'Published')) reload(); };
-    $$('[data-ap]', m).forEach(b => b.onclick = async () => { await call(() => DE.post(A('/ads/' + b.dataset.ap + '/approve')), 'Approved'); reload(); });
-    $$('[data-rj]', m).forEach(b => b.onclick = async () => { const o = await ask('Reject advert', [{ k: 'reason', label: 'Reason' }]); if (o) { await call(() => DE.post(A('/ads/' + b.dataset.rj + '/reject'), o), 'Rejected'); reload(); } });
-    $$('[data-ps]', m).forEach(b => b.onclick = async () => { await call(() => DE.post(A('/ads/' + b.dataset.ps + '/pause')), 'Paused'); reload(); });
-  };
-
-  // ---------- write-ups, pages
-  R.writeups = async m => {
-    const [w, pg, set] = await Promise.all([DE.get(A('/writeups')), DE.get(A('/custom-pages')), DE.get(A('/settings'))]);
-    const wf = async r => ask(r ? 'Edit write-up' : 'New write-up', [{ k: 'title', label: 'Title', v: r && r.title }, { k: 'body', label: 'Content (HTML allowed, scripts are removed)', type: 'textarea', v: r && r.body }, { k: 'placement', label: 'Where', type: 'select', v: r ? r.placement : 'home_top', options: [['home_top', 'Top of the home feed'], ['home_bottom', 'Bottom of the home feed'], ['sidebar', 'Sidebar'], ['footer', 'Footer']] }, { k: 'audience', label: 'Who sees it', type: 'select', v: r ? r.audience : 'all', options: [['all', 'Everyone'], ['guests', 'Visitors only'], ['members', 'Logged-in users']] }, { k: 'sort', label: 'Order', type: 'number', v: r ? r.sort : 0 }, { k: 'active', label: 'Active', type: 'check', v: r ? r.active : true, hint: 'Visible' }]);
-    m.innerHTML = '<h1>Write-ups & pages</h1>' + card('Write-ups on the site <button class="btn sm primary" id="nw" style="float:right">+ Add</button>', T(w, [['title', 'Title'], ['placement', 'Where'], ['audience', 'For'], ['active', 'Live', r => (r.active ? '✔' : '—')], ['x', '', r => '<button class="btn sm" data-we="' + r.id + '">Edit</button><button class="btn sm danger" data-wd="' + r.id + '">Delete</button>']])) +
-      card('Your own pages (About, FAQ, Contact...) <button class="btn sm primary" id="np" style="float:right">+ Add page</button>', T(pg, [['title', 'Title'], ['slug', 'Address', r => '/page/' + esc(r.slug)], ['in_menu', 'In menu', r => (r.in_menu ? '✔' : '—')], ['x', '', r => '<button class="btn sm" data-pe="' + r.id + '">Edit</button><button class="btn sm danger" data-pd="' + r.id + '">Delete</button>']])) +
-      card('Policy, terms & privacy', settingsForm(['policy_html', 'terms_html', 'privacy_html'].filter(k => k in set), set, 'pol'));
-    bindSettings(m);
-    $('#nw').onclick = async () => { const o = await wf(); if (o && await call(() => DE.post(A('/writeups'), o), 'Added')) reload(); };
-    $$('[data-we]', m).forEach(b => b.onclick = async () => { const o = await wf(w.find(x => String(x.id) === b.dataset.we)); if (o && await call(() => DE.put(A('/writeups/' + b.dataset.we), o), 'Saved')) reload(); });
-    $$('[data-wd]', m).forEach(b => b.onclick = async () => { if (await DE.confirm('Delete?', 'Delete')) { await call(() => DE.del(A('/writeups/' + b.dataset.wd))); reload(); } });
-    const pf = r => ask(r ? 'Edit page' : 'New page', [{ k: 'title', label: 'Title', v: r && r.title }, { k: 'content', label: 'Content (HTML allowed)', type: 'textarea', v: r && r.content }, { k: 'in_menu', label: 'Menu', type: 'check', v: r ? r.in_menu : true, hint: 'Show in the menu' }]);
-    $('#np').onclick = async () => { const o = await pf(); if (o && await call(() => DE.post(A('/custom-pages'), o), 'Added')) reload(); };
-    $$('[data-pe]', m).forEach(b => b.onclick = async () => { const o = await pf(pg.find(x => String(x.id) === b.dataset.pe)); if (o && await call(() => DE.put(A('/custom-pages/' + b.dataset.pe), o), 'Saved')) reload(); });
-    $$('[data-pd]', m).forEach(b => b.onclick = async () => { if (await DE.confirm('Delete this page?', 'Delete')) { await call(() => DE.del(A('/custom-pages/' + b.dataset.pd))); reload(); } });
-  };
-
-  // ---------- site, features, categories
-  R.site = async m => {
-    const [set, flags, cats] = await Promise.all([DE.get(A('/settings')), DE.get(A('/flags')), DE.get(A('/categories'))]);
-    const siteKeys = Object.keys(set).filter(k => k !== '_perm' && set._perm[k] === 'site' && !/^(policy|terms|privacy)/.test(k));
-    m.innerHTML = '<h1>Site & features</h1>' + card('Features (switch parts of the site on or off)', '<div class="permgrid">' + flags.map(f => '<label class="row"><input type="checkbox" data-f="' + esc(f.key) + '"' + (f.enabled ? ' checked' : '') + '> ' + esc(f.label || f.key) + '</label>').join('') + '</div>') +
-      card('Topics / categories', '<div class="chips">' + cats.map(c => '<span class="chip">' + esc(c.name || c) + ' <a href="#" data-dc="' + esc(c.id || '') + '">✕</a></span>').join('') + '</div><div class="row" style="margin-top:8px"><input class="i grow" id="nc" placeholder="New category"><button class="btn" id="ac">Add</button></div>') +
-      card('Site settings (name, theme, SEO keywords, sign-up rules...)', settingsForm(siteKeys, set, 'site'));
-    bindSettings(m);
-    $$('[data-f]', m).forEach(c => c.onchange = () => call(() => DE.put(A('/flags/' + c.dataset.f), { enabled: c.checked }), 'Saved'));
-    $('#ac').onclick = async () => { if ($('#nc').value && await call(() => DE.post(A('/categories'), { name: $('#nc').value }))) reload(); };
-    $$('[data-dc]', m).forEach(a => a.onclick = async e => { e.preventDefault(); if (a.dataset.dc) { await call(() => DE.del(A('/categories/' + a.dataset.dc))); reload(); } });
-  };
-
-  // ---------- AI
-  R.ai = async m => {
-    const r = await DE.get(A('/ai'));
-    const set = await DE.get(A('/settings'));
-    m.innerHTML = '<div class="row between"><h1>AI tutor</h1><button class="btn primary" id="add">+ Add AI provider</button></div><p class="muted">Until at least one provider is added, users see a “coming soon” page. Add as many providers as you like: they are tried in priority order.</p>' + card('Status', r.ready ? pill('live', 'ok') : pill('coming soon', 'warn')) +
-      card('Providers', T(r.providers, [['name', 'Name'], ['type', 'Type'], ['model', 'Model'], ['priority', 'Priority'], ['has_key', 'Key', x => (x.has_key ? '✔' : '—')], ['enabled', 'On', x => (x.enabled ? '✔' : '—')], ['x', '', x => '<button class="btn sm" data-t="' + x.id + '">Test</button><button class="btn sm" data-ed="' + x.id + '">Edit</button><button class="btn sm danger" data-d="' + x.id + '">Delete</button>']])) + card('AI settings', settingsForm(Object.keys(set).filter(k => /^ai_/.test(k)), set, 'ai'));
-    bindSettings(m);
-    const form = p => ask(p ? 'Edit provider' : 'Add AI provider', [{ k: 'name', label: 'Name', v: p && p.name }, { k: 'type', label: 'Type', type: 'select', v: p ? p.type : r.types[0], options: r.types.map(t => [t, t]) }, { k: 'base_url', label: 'API address (for OpenAI-compatible)', v: p && p.base_url }, { k: 'model', label: 'Model', v: p && p.model }, { k: 'api_key', label: 'API key' + (p ? ' (leave blank to keep)' : ''), type: 'password' }, { k: 'priority', label: 'Priority (lower first)', type: 'number', v: p ? p.priority : 10 }, { k: 'enabled', label: 'Enabled', type: 'check', v: p ? p.enabled : true, hint: 'Use this provider' }]);
-    $('#add').onclick = async () => { const o = await form(); if (o && await call(() => DE.post(A('/ai'), o), 'Added')) reload(); };
-    $$('[data-ed]', m).forEach(b => b.onclick = async () => { const o = await form(r.providers.find(x => String(x.id) === b.dataset.ed)); if (o) { if (!o.api_key) delete o.api_key; if (await call(() => DE.put(A('/ai/' + b.dataset.ed), o), 'Saved')) reload(); } });
-    $$('[data-d]', m).forEach(b => b.onclick = async () => { if (await DE.confirm('Delete this provider?', 'Delete')) { await call(() => DE.del(A('/ai/' + b.dataset.d))); reload(); } });
-    $$('[data-t]', m).forEach(b => b.onclick = async () => { const x = await call(() => DE.post(A('/ai/test'), { id: b.dataset.t })); if (x) DE.modal('<h2>Test reply</h2><p>' + esc(x.reply || JSON.stringify(x)) + '</p><button class="btn" data-close>Close</button>'); });
-  };
-
-  R.settings = async m => {
-    const set = await DE.get(A('/settings'));
-    const groups = {};
-    Object.keys(set).filter(k => k !== '_perm').forEach(k => { const g = (k.split('_')[0] || 'misc'); (groups[g] = groups[g] || []).push(k); });
-    m.innerHTML = '<h1>All settings</h1><p class="muted">Every setting you are allowed to change, grouped by name. Secret values show as ******** and are only replaced if you type a new one.</p><input class="i" id="flt" placeholder="Filter settings…">' + Object.keys(groups).sort().map(g => '<details class="card" data-g><summary><b>' + esc(g) + '</b> <span class="muted small">(' + groups[g].length + ')</span></summary>' + settingsForm(groups[g], set, 'g_' + g) + '</details>').join('');
-    bindSettings(m);
-    $('#flt').oninput = e => { const q = e.target.value.toLowerCase(); $$('.setrow', m).forEach(r => (r.style.display = !q || r.textContent.toLowerCase().includes(q) ? '' : 'none')); if (q) $$('[data-g]', m).forEach(d => (d.open = true)); };
-  };
-
-  // ---------- database (read-only browser; edits need the owner's password)
-  R.db = async m => {
-    const t = await DE.get(A('/db/tables'));
-    const name = DE.store.get('adm_tbl') || (t[0] && (t[0].name || t[0]));
-    m.innerHTML = '<h1>Database</h1><div class="row wrap"><select class="i" id="tb" style="max-width:300px">' + t.map(x => { const n = x.name || x; return '<option' + (n === name ? ' selected' : '') + '>' + esc(n) + '</option>'; }).join('') + '</select>' + (ME.owner ? '<button class="btn" id="sql">SQL console</button>' : '') + '</div><div id="tbl"></div>';
-    async function show(n, off) {
-      DE.store.set('adm_tbl', n);
-      const d = await DE.get(A('/db/table/' + encodeURIComponent(n) + '?offset=' + (off || 0)));
-      $('#tbl').innerHTML = '<p class="muted small">' + d.total + ' rows</p><div class="tablewrap"><table><tr>' + (ME.owner ? '<th></th>' : '') + d.cols.map(c => '<th>' + esc(c.name) + '</th>').join('') + '</tr>' + d.rows.map(r => '<tr>' + (ME.owner ? '<td><button class="btn sm" data-e="' + r._rowid_ + '">✎</button><button class="btn sm danger" data-x="' + r._rowid_ + '">🗑</button></td>' : '') + d.cols.map(c => '<td>' + esc(String(r[c.name] == null ? '' : r[c.name]).slice(0, 80)) + '</td>').join('') + '</tr>').join('') + '</table></div><div class="row"><button class="btn sm" id="pv"' + (off ? '' : ' disabled') + '>‹ Newer</button><button class="btn sm" id="nx"' + (d.total > (off || 0) + 50 ? '' : ' disabled') + '>Older ›</button></div>';
-      $('#pv').onclick = () => show(n, Math.max(0, (off || 0) - 50)); $('#nx').onclick = () => show(n, (off || 0) + 50);
-      $$('[data-e]').forEach(b => b.onclick = async () => { const row = d.rows.find(r => String(r._rowid_) === b.dataset.e); const o = await ask('Edit row ' + b.dataset.e, d.cols.filter(c => !c.pk).map(c => ({ k: c.name, label: c.name, v: row[c.name] }))); if (!o) return; const pw = await stepUp(); if (pw === null) return; await call(() => DE.put(A('/db/table/' + encodeURIComponent(n) + '/' + b.dataset.e), { values: o, password: pw }), 'Saved'); show(n, off); });
-      $$('[data-x]').forEach(b => b.onclick = async () => { if (!await DE.confirm('Delete this row?', 'Delete')) return; const pw = await stepUp(); if (pw === null) return; await call(() => DE.api('DELETE', A('/db/table/' + encodeURIComponent(n) + '/' + b.dataset.x), { password: pw }), 'Deleted'); show(n, off); });
+  if (req.query.reveal === '1') audit(req, 'db-reveal', name);
+  res.json({ cols, rows, total: db.prepare(`SELECT COUNT(*) c FROM "${name}"`).get().c });
+});
+// Editing data directly is owner-only, and asks for the owner's password again.
+const stepUp = (req, res, next) => {
+  const row = db.prepare('SELECT password_hash FROM users WHERE id=?').get(req.user.id);
+  if (!bcrypt.compareSync(String((req.body || {}).password || ''), row.password_hash)) return res.status(403).json({ error: 'Enter your password to confirm.', needs_password: true });
+  next();
+};
+router.put('/db/table/:name/:rowid', owner, stepUp, (req, res) => {
+  const name = req.params.name;
+  if (!tableNames().includes(name)) return res.status(404).json({ error: 'No such table.' });
+  const cols = db.prepare(`PRAGMA table_info("${name}")`).all().map(c => c.name);
+  const sets = [], vals = [];
+  Object.entries((req.body || {}).values || {}).forEach(([k, v]) => { if (cols.includes(k) && !/password_hash/.test(k)) { sets.push(`"${k}"=?`); vals.push(v); } });
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to update.' });
+  db.prepare(`UPDATE "${name}" SET ${sets.join(',')} WHERE rowid=?`).run(...vals, req.params.rowid);
+  audit(req, 'db-edit', name + '#' + req.params.rowid);
+  res.json({ ok: true });
+});
+router.delete('/db/table/:name/:rowid', owner, stepUp, (req, res) => {
+  const name = req.params.name;
+  if (!tableNames().includes(name)) return res.status(404).json({ error: 'No such table.' });
+  db.prepare(`DELETE FROM "${name}" WHERE rowid=?`).run(req.params.rowid);
+  audit(req, 'db-delete', name + '#' + req.params.rowid);
+  res.json({ ok: true });
+});
+router.post('/db/sql', owner, (req, res) => {
+  const sql = String((req.body || {}).sql || '').trim();
+  if (!sql) return res.status(400).json({ error: 'Enter a query.' });
+  if (/;\s*\S/.test(sql)) return res.status(400).json({ error: 'Run one statement at a time.' });
+  try {
+    const st = db.prepare(sql);
+    if (st.reader) {
+      const rows = st.all().slice(0, 500);
+      rows.forEach(r => Object.keys(r).forEach(k => { if (HIDDEN_COLS.test(k)) r[k] = '[hidden]'; }));
+      return res.json({ rows });
     }
-    $('#tb').onchange = e => show(e.target.value); show(name);
-    const sq = $('#sql'); if (sq) sq.onclick = async () => { const o = await ask('SQL console', [{ k: 'sql', label: 'SQL (SELECT runs directly; changes ask for your password)', type: 'textarea' }], 'Run'); if (!o) return; let r; try { r = await DE.post(A('/db/sql'), { sql: o.sql }); } catch (e) { if (e.needs_password || /password/i.test(e.message)) { const pw = await stepUp(); if (pw === null) return; r = await call(() => DE.post(A('/db/sql'), { sql: o.sql, password: pw })); } else return DE.fail(e); } if (r) DE.modal('<h2>Result</h2><pre style="max-height:50vh;overflow:auto">' + esc(JSON.stringify(r, null, 1)) + '</pre><button class="btn" data-close>Close</button>'); };
-  };
+    if (!(req.body || {}).confirm) return res.status(400).json({ error: 'This query changes data. Tick "I understand" to run it.', needs_confirm: true });
+    return stepUp(req, res, () => { const info = st.run(); audit(req, 'sql', sql); res.json({ changes: info.changes }); });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
-  R.backups = async m => {
-    const l = await DE.get(A('/backups'));
-    m.innerHTML = '<div class="row between"><h1>Backups</h1><button class="btn primary" id="mk">Back up now</button></div><p class="muted">A backup is made automatically every 6 hours. Downloading one asks for your password.</p><div class="card">' + T(l, [['file', 'File'], ['size', 'Size', r => Math.round(r.size / 1024) + ' KB'], ['x', '', r => '<button class="btn sm" data-dl="' + esc(r.file) + '">Download</button>']]) + '</div>';
-    $('#mk').onclick = async () => { await call(() => DE.post(A('/backups')), 'Backup created'); reload(); };
-    $$('[data-dl]', m).forEach(b => b.onclick = async () => { const pw = await stepUp(); if (pw === null) return; const res = await fetch('/api/admin/backups/' + encodeURIComponent(b.dataset.dl) + '/download', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'DigitalEnviro' }, body: JSON.stringify({ password: pw }) }); if (!res.ok) return DE.toast('Wrong password or download failed', true); const u = URL.createObjectURL(await res.blob()); const a = document.createElement('a'); a.href = u; a.download = b.dataset.dl; a.click(); URL.revokeObjectURL(u); });
-  };
+router.get('/backups', owner, (req, res) => {
+  const dir = path.join(__dirname, '..', '..', 'data', 'backups');
+  try { res.json(fs.readdirSync(dir).filter(f => /^backup-[\w.-]+\.db$/.test(f)).sort().reverse().map(f => ({ file: f, size: fs.statSync(path.join(dir, f)).size }))); } catch (e) { res.json([]); }
+});
+router.post('/backups', owner, async (req, res) => {
+  try { const f = await require('../jobs').backup(); audit(req, 'backup', f || ''); res.json({ ok: true, file: f }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+router.get('/backups/:file', owner, stepUp.bind(null), (req, res) => res.status(405).end()); // downloads use POST so the password is not in the URL
+router.post('/backups/:file/download', owner, stepUp, (req, res) => {
+  if (!/^backup-[\w.-]+\.db$/.test(req.params.file)) return res.status(400).json({ error: 'Bad file name.' });
+  const f = path.join(__dirname, '..', '..', 'data', 'backups', req.params.file);
+  if (!fs.existsSync(f)) return res.status(404).json({ error: 'Not found.' });
+  audit(req, 'backup-download', req.params.file);
+  res.download(f);
+});
 
-  R.audit = async m => {
-    const rows = await DE.get(A('/audit'));
-    m.innerHTML = '<h1>Audit log</h1><p class="muted">Everything admins did, including who looked at private user details.</p><div class="card">' + T(rows, [['created_at', 'When', r => when(r.created_at)], ['username', 'Who', r => '@' + esc(r.username || '?')], ['action', 'Action'], ['detail', 'Detail', r => esc(String(r.detail || '').slice(0, 120))]]) + '</div>';
-  };
-
-  // ------------------------------------------------------------ boot
-  async function boot() {
-    try { DE.world = await DE.get('/public/world'); const c = await DE.get('/public/config'); DE.config = Object.assign(DE.config || {}, c); } catch (e) { /* ignore */ }
-    const th = DE.store.get('de_theme'); if (th) document.documentElement.dataset.theme = th;
-    try { ME = await DE.get(A('/me')); } catch (e) { return loginScreen(e.status === 403 ? 'This account is not an admin. Sign in with an admin account.' : null); }
-    const h = (location.hash || '').slice(1); if (h && R[h] && visible(SECTIONS.find(s => s[0] === h))) SECTION = h;
-    frame(); load();
-  }
-  document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', boot) : boot();
-})();
+module.exports = router;

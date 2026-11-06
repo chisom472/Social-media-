@@ -1,121 +1,259 @@
-/* Classes: browse, host, enrol (free or paid), live room (Jitsi), recorded lessons */
-(function () {
-  const { esc } = DE;
-  const when = c => c.kind === 'recorded' ? 'Recorded course' : new Date(String(c.starts_at).replace(' ', 'T') + 'Z').toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
-  const priceOf = c => c.price ? DE.money(c.price, c.currency) : 'Free';
-  const card = c => '<a class="card flat classcard" href="/class/' + c.id + '" style="color:inherit;display:block">' + (c.cover ? '<img src="' + esc(c.cover) + '" alt="" loading="lazy" style="border-radius:10px;width:100%;max-height:150px;object-fit:cover">' : '') +
-    '<h3>' + esc(c.title) + '</h3><div class="muted small">' + esc(when(c)) + ' · ' + esc(c.kind) + '</div><div class="muted small">by @' + esc(c.host) + ' in ' + esc(c.group_name) + '</div>' +
-    '<div class="row" style="margin-top:6px"><span class="pill ' + (c.price ? 'warn' : 'ok') + '">' + priceOf(c) + '</span><span class="muted small">' + c.enrolled + ' enrolled' + (c.full ? ' · full' : '') + '</span></div></a>';
+const express = require('express');
+const crypto = require('crypto');
+const { db, getSetting, notify } = require('../db');
+const { requireAuth, optionalAuth, featureOn, restrict, hasPerm } = require('../auth');
+const { uploadMedia, claimMedia, removeFile } = require('../upload');
+const { safeUrl } = require('../utils');
+const ownerfees = require('../ownerfees');
+const world = require('../world');
+const access = require('../access');
+const policyOf = b => (b.access_policy === 'end' ? 'end' : 'keep');
+const graceOf = b => Math.max(0, Math.min(365, parseInt(b.access_grace_days, 10) || 0));
 
-  DE.route('/classes', async (view, p, q) => {
-    DE.title('Classes');
-    const f = q.price || '';
-    const list = await DE.get('/classes' + (f ? '?price=' + f : ''));
-    view.innerHTML = '<div class="row between wrap"><h1>Classes</h1>' + (DE.user ? '<div class="row"><a class="btn" href="/my-classes">My classes</a><a class="btn primary" href="/classes/new">+ Host a class</a></div>' : '') + '</div>' +
-      '<div class="chips"><a class="chip ' + (!f ? 'on' : '') + '" href="/classes">All</a><a class="chip ' + (f === 'free' ? 'on' : '') + '" href="/classes?price=free">Free</a><a class="chip ' + (f === 'paid' ? 'on' : '') + '" href="/classes?price=paid">Paid</a></div>' +
-      (list.length ? '<div class="grid">' + list.map(card).join('') + '</div>' : '<div class="card empty">No classes yet. Be the first to host one!</div>');
+const router = express.Router();
+router.use(featureOn('classes'));
+
+const toSql = v => { const d = new Date(v); return isNaN(d) ? null : d.toISOString().slice(0, 19).replace('T', ' '); };
+const isMember = (gid, uid) => !!(uid && db.prepare('SELECT 1 FROM active_members WHERE group_id=? AND user_id=?').get(gid, uid));
+const enrolled = (cid, uid) => !!(uid && db.prepare('SELECT 1 FROM class_enrollments WHERE class_id=? AND user_id=?').get(cid, uid));
+
+const LIST_SQL = `SELECT c.id,c.group_id,c.owner_id,c.title,c.description,c.kind,c.starts_at,c.duration_min,c.capacity,c.price,c.currency,c.open_to,c.cover,c.active,c.fee_status,c.access_policy,c.access_grace_days,
+  g.name AS group_name, u.username AS host, u.display_name AS host_name, u.avatar AS host_avatar,
+  (SELECT COUNT(*) FROM class_enrollments WHERE class_id=c.id) AS enrolled
+  FROM classes c JOIN groups_ g ON g.id=c.group_id JOIN users u ON u.id=c.owner_id`;
+
+function shape(rows, uid) {
+  return rows.map(c => ({ ...c, is_host: c.owner_id === uid, joined: enrolled(c.id, uid), free: c.price === 0, full: !!(c.capacity && c.enrolled >= c.capacity) }));
+}
+
+router.get('/', optionalAuth, (req, res) => {
+  const w = ["c.active=1"], a = [];
+  if (req.query.group_id) { w.push('c.group_id=?'); a.push(parseInt(req.query.group_id, 10)); }
+  if (req.query.price === 'free') w.push('c.price=0');
+  if (req.query.price === 'paid') w.push('c.price>0');
+  if (req.query.when === 'past') w.push("c.kind='live' AND datetime(c.starts_at,'+'||c.duration_min||' minutes') < datetime('now')");
+  else w.push("(c.kind!='live' OR datetime(c.starts_at,'+'||c.duration_min||' minutes') >= datetime('now'))");
+  const rows = db.prepare(LIST_SQL + ' WHERE ' + w.join(' AND ') + " ORDER BY c.kind='live' DESC, c.starts_at ASC LIMIT 60").all(...a);
+  res.json(shape(rows, req.user && req.user.id));
+});
+
+router.get('/mine', requireAuth, (req, res) => {
+  res.json({
+    hosting: shape(db.prepare(LIST_SQL + ' WHERE c.owner_id=? ORDER BY c.id DESC').all(req.user.id), req.user.id),
+    attending: shape(db.prepare(LIST_SQL + ' JOIN class_enrollments e ON e.class_id=c.id WHERE e.user_id=? AND c.active=1 ORDER BY c.starts_at DESC').all(req.user.id), req.user.id)
   });
+});
 
-  DE.route('/my-classes', async view => {
-    DE.title('My classes');
-    const r = await DE.get('/classes/mine');
-    view.innerHTML = '<h1>My classes</h1><h2>Hosting</h2>' + (r.hosting.length ? '<div class="grid">' + r.hosting.map(card).join('') + '</div>' : '<p class="muted">You are not hosting any class.</p>') +
-      '<h2>Attending</h2>' + (r.attending.length ? '<div class="grid">' + r.attending.map(card).join('') + '</div>' : '<p class="muted">You have not enrolled in any class.</p>');
-  }, { auth: true });
+router.get('/:id', optionalAuth, (req, res) => {
+  const c = db.prepare(LIST_SQL + ' WHERE c.id=?').get(req.params.id);
+  if (!c || (!c.active && !(req.user && (req.user.id === c.owner_id || hasPerm(req.user, 'content'))))) return res.status(404).json({ error: 'Class not found.' });
+  const uid = req.user && req.user.id;
+  const host = uid === c.owner_id;
+  const inv = host ? db.prepare("SELECT id,amount,currency,due_at,status FROM owner_invoices WHERE class_id=? AND kind='class_fee' ORDER BY id DESC LIMIT 1").get(c.id) : null;
+  const out = shape([c], uid)[0];
+  out.member = isMember(c.group_id, uid);
+  out.can_enroll = c.active && !out.joined && !out.full && (c.open_to === 'anyone' || out.member || host);
+  out.lessons_count = db.prepare('SELECT COUNT(*) n FROM class_lessons WHERE class_id=?').get(c.id).n;
+  out.fee_invoice = inv && inv.status === 'due' && ownerfees.paymentsOn('class_fee') && !ownerfees.waived(uid) ? inv : null;
+  out.replay_url = out.joined || host ? db.prepare('SELECT replay_url FROM classes WHERE id=?').get(c.id).replay_url : null;
+  out.meeting_ready = !(db.prepare("SELECT 1 FROM owner_invoices WHERE class_id=? AND kind='class_fee' AND status='due' AND ?='before_start'").get(c.id, getSetting('class_fee_when')) && ownerfees.paymentsOn('class_fee'));
+  res.json(out);
+});
 
-  DE.route('/classes/new', async view => {
-    DE.title('Host a class');
-    const groups = (await DE.get('/groups/mine')).filter(g => g.owner_id === DE.user.id);
-    if (!groups.length) { view.innerHTML = '<div class="card empty"><h2>Create a community first</h2><p>Classes are hosted inside your own community.</p><a class="btn primary" href="/communities">Go to communities</a></div>'; return; }
-    view.innerHTML = '<h1>Host a class</h1><form class="card" id="f"><label class="f">Community</label><select class="i" id="g">' + groups.map(g => '<option value="' + g.id + '">' + esc(g.name) + '</option>').join('') + '</select>' +
-      '<label class="f">Title</label><input class="i" id="t" maxlength="120" required><label class="f">Description</label><textarea class="i" id="d" maxlength="3000"></textarea>' +
-      '<label class="f">Type</label><select class="i" id="k"><option value="live">Live class (built-in video room)</option><option value="external">Live class (my own Zoom/Meet link)</option><option value="recorded">Recorded course (lessons)</option></select>' +
-      '<div id="live"><div class="two"><div><label class="f">Starts</label><input class="i" type="datetime-local" id="s"></div><div><label class="f">Minutes</label><input class="i" type="number" id="m" value="60" min="10" max="720"></div></div><div id="ext" class="hidden"><label class="f">Meeting link</label><input class="i" id="u" placeholder="https://"></div></div>' +
-      '<div class="two"><div><label class="f">Price (0 = free)</label><input class="i" type="number" id="p" min="0" step="any" value="0"></div><div><label class="f">Currency</label>' + DE.currencySelect('c') + '</div></div>' +
-      '<div class="two"><div><label class="f">Seats (empty = unlimited)</label><input class="i" type="number" id="cap" min="1"></div><div><label class="f">Who can join</label><select class="i" id="o"><option value="members">Community members</option><option value="anyone">Anyone</option></select></div></div>' +
-      '<div id="acc" class="card flat hidden"><h3>Community access after the class</h3><p class="muted small">Students of a paid community pay for access. Choose what happens to their subscription when this class is over. You can still change this later.</p><label class="row"><input type="radio" name="ap" value="keep" checked> Keep their subscription running as normal</label><label class="row"><input type="radio" name="ap" value="end"> End their subscription when the class is over</label><div id="grw" class="hidden"><label class="f">Keep access for this many extra days after the class (0 = end straight away)</label><input class="i" type="number" id="gr" min="0" max="365" value="0" style="max-width:140px"></div></div>' +
-      '<div class="err" id="err"></div><button class="btn primary" style="margin-top:14px">Create class</button></form>';
-    const gs = groups; const showAcc = () => { const g = gs.find(x => String(x.id) === DE.$('#g').value); DE.$('#acc').classList.toggle('hidden', !(g && g.price > 0)); };
-    DE.$('#g').onchange = showAcc; showAcc();
-    DE.$$('[name=ap]').forEach(r => (r.onchange = () => DE.$('#grw').classList.toggle('hidden', DE.$('[name=ap]:checked').value !== 'end')));
-    const k = DE.$('#k'); const sync = () => { DE.$('#live').classList.toggle('hidden', k.value === 'recorded'); DE.$('#ext').classList.toggle('hidden', k.value !== 'external'); }; k.onchange = sync; sync();
-    DE.$('#f').onsubmit = async e => {
-      e.preventDefault();
-      try {
-        const r = await DE.post('/classes', { group_id: DE.$('#g').value, title: DE.$('#t').value, description: DE.$('#d').value, kind: k.value, starts_at: DE.$('#s').value ? new Date(DE.$('#s').value).toISOString() : '', duration_min: DE.$('#m').value, meeting_url: DE.$('#u').value,
-          price: DE.$('#p').value, currency: DE.$('#c').value, capacity: DE.$('#cap').value, open_to: DE.$('#o').value, access_policy: DE.$('[name=ap]:checked').value, access_grace_days: DE.$('#gr').value });
-        if (r.fee && r.fee.payable_now) DE.toast('Class created. Pay the hosting fee to publish it.');
-        DE.navigate('/class/' + r.id);
-      } catch (ex) { DE.$('#err').textContent = ex.message; }
-    };
-  }, { auth: true });
-
-  function loadJitsi(domain) {
-    return new Promise((res, rej) => { if (window.JitsiMeetExternalAPI) return res(); const s = document.createElement('script'); s.src = 'https://' + domain + '/external_api.js'; s.onload = res; s.onerror = () => rej(new Error('Could not load the video room.')); document.head.appendChild(s); });
+router.post('/', requireAuth, restrict('class'), (req, res) => {
+  const b = req.body || {};
+  const g = db.prepare('SELECT * FROM groups_ WHERE id=?').get(b.group_id);
+  if (!g || g.owner_id !== req.user.id) return res.status(403).json({ error: 'Choose one of your own communities to host the class in.' });
+  const overdue = ownerfees.blocked(req.user.id, 'classes');
+  if (overdue) return res.status(403).json({ error: 'Please pay your overdue fee (' + world.format(overdue.amount, overdue.currency) + ') before hosting another class.', fee_due: true });
+  const title = String(b.title || '').trim().slice(0, 120);
+  if (title.length < 3) return res.status(400).json({ error: 'Give the class a title.' });
+  const kind = ['live', 'recorded', 'external'].includes(b.kind) ? b.kind : 'live';
+  let startsAt = null;
+  if (kind !== 'recorded') {
+    startsAt = toSql(b.starts_at);
+    if (!startsAt || startsAt < new Date(Date.now() - 5 * 60000).toISOString().slice(0, 19).replace('T', ' ')) return res.status(400).json({ error: 'Choose a start date and time in the future.' });
   }
-
-  // Host controls: what happens to students' community subscription after the class, plus extend / end per student
-  async function accessPanel(c) {
-    const a = await DE.get('/classes/' + c.id + '/access');
-    const row = s => '<div class="row" style="padding:6px 0;border-bottom:1px solid var(--line)">' + DE.avatar(s, 'sm') + '<span class="grow">@' + esc(s.username) + '<div class="muted small">' + (s.role === 'owner' ? 'Owner' : s.active ? (s.expires_at ? 'Access until ' + esc(String(s.expires_at).slice(0, 16)) : 'Lifetime access') : 'No active access') + '</div></span>' +
-      (s.role === 'owner' ? '' : '<button class="btn sm" data-ext="' + s.id + '">+ Extend</button>' + (s.active ? '<button class="btn sm danger" data-end="' + s.id + '">End</button>' : '')) + '</div>';
-    DE.modal('<h2>Student access</h2><p class="muted small">Applies to the paid community “' + esc(c.group_name) + '”.</p>' +
-      '<div class="card flat"><b>When this class is over</b><label class="row"><input type="radio" name="p" value="keep"' + (a.policy === 'keep' ? ' checked' : '') + '> Keep subscriptions running</label><label class="row"><input type="radio" name="p" value="end"' + (a.policy === 'end' ? ' checked' : '') + '> End subscriptions</label>' +
-      '<div class="row"><span class="small">Extra days of access after the class:</span><input class="i" type="number" id="gd" min="0" max="365" value="' + a.grace_days + '" style="max-width:90px"></div><button class="btn sm primary" id="savep" style="margin-top:8px">Save</button>' + (a.applied ? ' <span class="pill">Already applied</span>' : '') + '</div>' +
-      '<div class="row wrap" style="margin:10px 0"><button class="btn" id="extAll">+ Extend everyone</button><button class="btn danger" id="endAll">End everyone’s access now</button></div>' +
-      '<div style="max-height:40vh;overflow:auto">' + (a.students.map(row).join('') || '<p class="muted">No students yet.</p>') + '</div><div class="err" id="err"></div><button class="btn" data-close style="margin-top:10px">Close</button>', (m, close) => {
-      const days = async () => { const v = prompt('How many days should access be extended by?', '30'); const n = parseInt(v, 10); if (!v) return 0; if (!(n >= 1)) { DE.toast('Enter a number of days.', true); return 0; } return n; };
-      const done = r => { DE.toast(r.extended != null ? 'Extended for ' + r.extended + ' student(s)' : 'Ended for ' + r.ended + ' student(s)'); close(); accessPanel(c); };
-      m.querySelector('#savep').onclick = async () => { try { await DE.put('/classes/' + c.id, { access_policy: m.querySelector('[name=p]:checked').value, access_grace_days: m.querySelector('#gd').value }); DE.toast('Saved'); } catch (e) { m.querySelector('#err').textContent = e.message; } };
-      m.querySelector('#extAll').onclick = async () => { const n = await days(); if (n) done(await DE.post('/classes/' + c.id + '/access/extend', { days: n }).catch(DE.fail)); };
-      m.querySelector('#endAll').onclick = async () => { if (await DE.confirm('End community access for every student of this class now? Students who still have another upcoming class in this community are skipped.', 'End access')) done(await DE.post('/classes/' + c.id + '/access/end', { grace_days: 0 }).catch(DE.fail)); };
-      DE.$$('[data-ext]', m).forEach(b => b.onclick = async () => { const n = await days(); if (n) done(await DE.post('/classes/' + c.id + '/access/extend', { days: n, user_id: b.dataset.ext }).catch(DE.fail)); });
-      DE.$$('[data-end]', m).forEach(b => b.onclick = async () => { if (await DE.confirm('End this student’s access now?', 'End access')) done(await DE.post('/classes/' + c.id + '/access/end', { grace_days: 0, user_id: b.dataset.end }).catch(DE.fail)); });
-    });
+  let meeting = null;
+  if (kind === 'external') {
+    meeting = safeUrl(b.meeting_url);
+    if (!meeting) return res.status(400).json({ error: 'Enter the full meeting link (https://...).' });
   }
+  const currency = world.normCurrency(b.currency, g.currency || 'USD');
+  const price = Math.max(0, world.toMinor(b.price, currency));
+  const duration = Math.min(720, Math.max(10, parseInt(b.duration_min, 10) || 60));
+  const capacity = parseInt(b.capacity, 10) > 0 ? Math.min(100000, parseInt(b.capacity, 10)) : null;
+  const room = kind === 'live' ? 'de-' + crypto.randomBytes(10).toString('hex') : null;
+  const fee = ownerfees.classFee(req.user.id, { price });
 
-  DE.route('/class/:id', async (view, p) => {
-    const c = await DE.get('/classes/' + p.id);
-    DE.title(c.title);
-    const inv = c.fee_invoice;
-    view.innerHTML = '<article class="card">' + (c.cover ? '<img src="' + esc(c.cover) + '" alt="" style="border-radius:12px;width:100%;max-height:240px;object-fit:cover">' : '') +
-      '<h1>' + esc(c.title) + '</h1><div class="muted">' + esc(when(c)) + (c.kind !== 'recorded' ? ' · ' + c.duration_min + ' min' : '') + ' · ' + esc(priceOf(c)) + '</div>' +
-      '<div class="row" style="margin:8px 0"><a href="/u/' + esc(c.host) + '">' + DE.avatar({ username: c.host, display_name: c.host_name, avatar: c.host_avatar }, 'sm') + '</a><span>Hosted by <a href="/u/' + esc(c.host) + '">' + esc(c.host_name || c.host) + '</a> in <a href="/community/' + c.group_id + '">' + esc(c.group_name) + '</a></span></div>' +
-      '<p style="white-space:pre-wrap">' + esc(c.description) + '</p><div class="muted small">' + c.enrolled + ' enrolled' + (c.capacity ? ' of ' + c.capacity : '') + '</div>' +
-      (inv ? '<div class="card warnbox">Hosting fee due: <b>' + DE.money(inv.amount, inv.currency) + '</b> <button class="btn sm primary" id="payFee">Pay now</button></div>' : '') +
-      '<div class="row wrap" id="acts" style="margin-top:12px"></div><div id="room"></div><div id="lessons"></div>' + (c.replay_url ? '<p><a class="btn" href="' + esc(c.replay_url) + '" target="_blank" rel="noopener">▶ Watch replay</a></p>' : '') + '</article>';
-    const acts = DE.$('#acts');
-    const btn = (id, label, cls) => acts.insertAdjacentHTML('beforeend', '<button class="btn ' + (cls || '') + '" id="' + id + '">' + label + '</button>');
-    if (!DE.user) acts.innerHTML = '<a class="btn primary" href="/login?next=' + encodeURIComponent('/class/' + c.id) + '">Log in to enrol</a>';
-    else {
-      if (c.can_enroll) btn('enrol', c.price ? 'Enrol for ' + priceOf(c) : 'Enrol free', 'primary');
-      else if (!c.joined && !c.is_host && !c.full && !c.member) acts.innerHTML = '<span class="muted">Join the community to enrol.</span> <a class="btn" href="/community/' + c.group_id + '">Open community</a>';
-      if (c.full && !c.joined) acts.innerHTML = '<span class="pill bad">Class is full</span>';
-      if ((c.joined || c.is_host) && c.kind !== 'recorded') btn('join', '🎥 Join class', 'primary');
-      if ((c.joined || c.is_host) && c.kind === 'recorded') loadLessons();
-      if (c.joined && !c.price) btn('leave', 'Leave');
-      if (c.is_host) { btn('att', 'Attendees'); btn('acc', '🔑 Student access'); btn('del', 'Cancel class', 'danger'); if (c.kind === 'recorded') loadLessons(true); }
+  const id = db.transaction(() => {
+    const info = db.prepare(`INSERT INTO classes(group_id,owner_id,title,description,kind,starts_at,duration_min,capacity,price,currency,open_to,room,meeting_url,active,fee_status,access_policy,access_grace_days)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(g.id, req.user.id, title, String(b.description || '').slice(0, 3000), kind, startsAt, duration, capacity, price, currency, b.open_to === 'anyone' ? 'anyone' : 'members', room, meeting,
+        fee && fee.when === 'create' ? 0 : 1, fee ? (fee.when === 'after' ? 'pending_after' : 'due') : 'none', g.price > 0 ? policyOf(b) : 'keep', graceOf(b));
+    if (fee && fee.when !== 'after') {
+      ownerfees.createInvoice({ userId: req.user.id, kind: 'class_fee', classId: info.lastInsertRowid, amount: fee.amount, currency: fee.currency, graceDays: 0, note: 'Hosting fee for class "' + title + '"' });
+      if (fee.when === 'before_start' && startsAt) db.prepare("UPDATE owner_invoices SET due_at=? WHERE class_id=? AND kind='class_fee'").run(startsAt, info.lastInsertRowid);
     }
-    const e1 = DE.$('#enrol'); if (e1) e1.onclick = () => DE.busy(e1, async () => { if (c.price) return DE.checkout({ purpose: 'class', class_id: c.id }); await DE.post('/classes/' + c.id + '/enroll'); DE.toast('You are enrolled!'); DE.render(); });
-    const lv = DE.$('#leave'); if (lv) lv.onclick = () => DE.busy(lv, async () => { await DE.post('/classes/' + c.id + '/leave'); DE.render(); });
-    const pf = DE.$('#payFee'); if (pf) pf.onclick = () => DE.busy(pf, () => DE.checkout({ purpose: 'owner_invoice', invoice_id: inv.id }));
-    const dl = DE.$('#del'); if (dl) dl.onclick = async () => { if (await DE.confirm('Cancel this class? Enrolled people will be told.', 'Cancel class')) { try { await DE.del('/classes/' + c.id); DE.navigate('/classes'); } catch (e) { DE.fail(e); } } };
-    const ac = DE.$('#acc'); if (ac) ac.onclick = () => accessPanel(c);
-    const at = DE.$('#att'); if (at) at.onclick = async () => { const l = await DE.get('/classes/' + c.id + '/attendees'); DE.modal('<h2>Attendees (' + l.length + ')</h2>' + (l.map(u => DE.userRow(u, false)).join('') || '<p class="muted">Nobody yet.</p>') + '<button class="btn" data-close>Close</button>'); };
-    const jn = DE.$('#join'); if (jn) jn.onclick = () => DE.busy(jn, async () => {
-      const r = await DE.get('/classes/' + c.id + '/join');
-      if (r.type === 'external') return window.open(r.url, '_blank', 'noopener');
-      await loadJitsi(r.domain);
-      DE.$('#room').innerHTML = '<div id="jitsi" style="height:70vh;margin-top:14px;border-radius:12px;overflow:hidden"></div>';
-      const api = new JitsiMeetExternalAPI(r.domain, { roomName: r.room, parentNode: DE.$('#jitsi'), userInfo: { displayName: r.name }, configOverwrite: { subject: r.subject, prejoinPageEnabled: false }, interfaceConfigOverwrite: { MOBILE_APP_PROMO: false } });
-      DE.cleanup = () => api.dispose();
-    });
-    async function loadLessons(editable) {
-      const l = await DE.get('/classes/' + c.id + '/lessons').catch(() => []);
-      DE.$('#lessons').innerHTML = '<h2>Lessons</h2>' + (l.length ? l.map((x, i) => '<div class="card flat"><b>' + (i + 1) + '. ' + esc(x.title) + '</b>' + (x.body ? '<p>' + esc(x.body) + '</p>' : '') + (x.media ? (/\.(mp4|webm|mov)$/i.test(x.media) ? '<video src="' + esc(x.media) + '" controls playsinline style="width:100%"></video>' : /\.(mp3|wav|m4a)$/i.test(x.media) ? '<audio src="' + esc(x.media) + '" controls></audio>' : '<a href="' + esc(x.media) + '" target="_blank" rel="noopener">Open file</a>') : '') + (c.is_host ? ' <button class="btn sm danger" data-dl="' + x.id + '">Delete</button>' : '') + '</div>').join('') : '<p class="muted">No lessons yet.</p>') +
-        (c.is_host ? '<form id="lf" class="card flat"><h3>Add a lesson</h3><input class="i" name="title" placeholder="Lesson title" required maxlength="120"><textarea class="i" name="body" placeholder="Notes (optional)"></textarea><input class="i" type="file" name="media" accept="video/*,audio/*,image/*,application/pdf"><button class="btn primary" style="margin-top:8px">Add lesson</button></form>' : '');
-      DE.$$('[data-dl]').forEach(b => b.onclick = async () => { await DE.del('/classes/lessons/' + b.dataset.dl); loadLessons(); });
-      const lf = DE.$('#lf'); if (lf) lf.onsubmit = async e => { e.preventDefault(); const fd = new FormData(lf); if (!fd.get('media').size) fd.delete('media'); try { await DE.post('/classes/' + c.id + '/lessons', fd); loadLessons(); } catch (ex) { DE.fail(ex); } };
-    }
-  });
-})();
+    return info.lastInsertRowid;
+  })();
+  const invoice = fee && fee.when !== 'after' ? db.prepare("SELECT id,amount,currency,due_at FROM owner_invoices WHERE class_id=? AND kind='class_fee'").get(id) : null;
+  // announce to community members
+  if (!(fee && fee.when === 'create')) {
+    db.prepare("SELECT user_id FROM active_members WHERE group_id=? AND user_id!=?").all(g.id, req.user.id)
+      .forEach(m => notify(m.user_id, 'class', 'New ' + (price ? 'paid' : 'free') + ' class in ' + g.name + ': ' + title, '/class/' + id));
+  }
+  res.json({ id, fee: fee ? { amount: fee.amount, currency: fee.currency, when: fee.when, invoice_id: invoice ? invoice.id : null, payable_now: fee.when === 'create' } : null });
+});
+
+router.put('/:id', requireAuth, restrict('class'), (req, res) => {
+  const c = db.prepare('SELECT * FROM classes WHERE id=?').get(req.params.id);
+  if (!c || c.owner_id !== req.user.id) return res.status(403).json({ error: 'Not allowed.' });
+  const b = req.body || {};
+  const paidIn = db.prepare('SELECT COUNT(*) n FROM class_enrollments WHERE class_id=?').get(c.id).n > 0 && c.price > 0;
+  let startsAt = null;
+  if (b.starts_at) { startsAt = toSql(b.starts_at); if (!startsAt) return res.status(400).json({ error: 'Invalid date.' }); }
+  const cur = world.normCurrency(b.currency, c.currency);
+  if (b.price != null && paidIn && world.toMinor(b.price, cur) !== c.price) return res.status(400).json({ error: 'People have already paid, so the price cannot change.' });
+  const meeting = b.meeting_url ? safeUrl(b.meeting_url) : null;
+  if (b.meeting_url && !meeting) return res.status(400).json({ error: 'Enter a valid https:// meeting link.' });
+  db.prepare(`UPDATE classes SET title=COALESCE(?,title), description=COALESCE(?,description), starts_at=COALESCE(?,starts_at), duration_min=COALESCE(?,duration_min),
+    capacity=COALESCE(?,capacity), open_to=COALESCE(?,open_to), meeting_url=COALESCE(?,meeting_url), replay_url=COALESCE(?,replay_url), price=COALESCE(?,price), currency=?, reminded=CASE WHEN ? IS NULL THEN reminded ELSE 0 END WHERE id=?`)
+    .run(b.title ? String(b.title).slice(0, 120) : null, b.description != null ? String(b.description).slice(0, 3000) : null, startsAt,
+      b.duration_min ? Math.min(720, Math.max(10, parseInt(b.duration_min, 10) || 60)) : null, parseInt(b.capacity, 10) > 0 ? parseInt(b.capacity, 10) : null,
+      ['members', 'anyone'].includes(b.open_to) ? b.open_to : null, meeting, b.replay_url ? safeUrl(b.replay_url) : null,
+      b.price != null ? Math.max(0, world.toMinor(b.price, cur)) : null, cur, startsAt, c.id);
+  if (b.access_policy != null) db.prepare('UPDATE classes SET access_policy=?, access_grace_days=? WHERE id=?').run(policyOf(b), graceOf(b), c.id);
+  if (startsAt) db.prepare('SELECT user_id FROM class_enrollments WHERE class_id=?').all(c.id).forEach(e => notify(e.user_id, 'class', 'The time of "' + c.title + '" changed. Check the new schedule.', '/class/' + c.id));
+  res.json({ ok: true });
+});
+
+/** Cancel a class. Not possible once people have paid (change the date instead). */
+router.delete('/:id', requireAuth, (req, res) => {
+  const c = db.prepare('SELECT * FROM classes WHERE id=?').get(req.params.id);
+  if (!c || (c.owner_id !== req.user.id && !hasPerm(req.user, 'content'))) return res.status(403).json({ error: 'Not allowed.' });
+  const n = db.prepare('SELECT COUNT(*) n FROM class_enrollments WHERE class_id=?').get(c.id).n;
+  if (n && c.price > 0 && c.owner_id === req.user.id) return res.status(400).json({ error: 'People have already paid for this class, so it cannot be deleted. Change the date instead, or contact the site owner.' });
+  db.prepare('SELECT user_id FROM class_enrollments WHERE class_id=?').all(c.id).forEach(e => notify(e.user_id, 'class', '"' + c.title + '" was cancelled by the host.', '/classes'));
+  db.prepare('DELETE FROM classes WHERE id=?').run(c.id);
+  res.json({ ok: true });
+});
+
+router.post('/:id/cover', requireAuth, uploadMedia.single('media'), async (req, res) => {
+  try {
+    const c = db.prepare('SELECT * FROM classes WHERE id=?').get(req.params.id);
+    if (!c || c.owner_id !== req.user.id) { if (req.file) removeFile(req.file); return res.status(403).json({ error: 'Not allowed.' }); }
+    if (!req.file || !/^image\//.test(req.file.mimetype)) { if (req.file) removeFile(req.file); return res.status(400).json({ error: 'Choose a picture.' }); }
+    const m = await claimMedia(req.file, req.user.id);
+    db.prepare('UPDATE classes SET cover=? WHERE id=?').run(m.url, c.id);
+    res.json({ url: m.url });
+  } catch (e) {
+    if (req.file) removeFile(req.file);
+    res.status(e.status || 400).json({ error: e.message, owner: e.owner });
+  }
+});
+
+// ---------- Enrolment ----------
+router.post('/:id/enroll', requireAuth, (req, res) => {
+  const c = db.prepare('SELECT * FROM classes WHERE id=? AND active=1').get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Class not found.' });
+  if (c.price > 0) return res.status(402).json({ error: 'This is a paid class. Use checkout to enrol.', needs_payment: true, amount: c.price, currency: c.currency });
+  if (c.open_to === 'members' && c.owner_id !== req.user.id && !isMember(c.group_id, req.user.id)) return res.status(403).json({ error: 'Join the community to enrol in this class.' });
+  if (c.capacity && db.prepare('SELECT COUNT(*) n FROM class_enrollments WHERE class_id=?').get(c.id).n >= c.capacity) return res.status(400).json({ error: 'This class is full.' });
+  const r = db.prepare('INSERT OR IGNORE INTO class_enrollments(class_id,user_id) VALUES(?,?)').run(c.id, req.user.id);
+  if (r.changes) notify(c.owner_id, 'class', '@' + req.user.username + ' enrolled in "' + c.title + '"', '/class/' + c.id);
+  res.json({ enrolled: true });
+});
+router.post('/:id/leave', requireAuth, (req, res) => {
+  const c = db.prepare('SELECT price FROM classes WHERE id=?').get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Class not found.' });
+  if (c.price > 0) return res.status(400).json({ error: 'Paid enrolments cannot be cancelled here. Contact the host.' });
+  db.prepare('DELETE FROM class_enrollments WHERE class_id=? AND user_id=?').run(req.params.id, req.user.id);
+  res.json({ enrolled: false });
+});
+
+router.get('/:id/attendees', requireAuth, (req, res) => {
+  const c = db.prepare('SELECT owner_id FROM classes WHERE id=?').get(req.params.id);
+  if (!c || c.owner_id !== req.user.id) return res.status(403).json({ error: 'Only the host can see who is attending.' });
+  res.json(db.prepare('SELECT u.id,u.username,u.display_name,u.avatar,e.created_at FROM class_enrollments e JOIN users u ON u.id=e.user_id WHERE e.class_id=? ORDER BY e.created_at DESC').all(req.params.id));
+});
+
+// ---------- Community access for this class's students (host controls) ----------
+const hostOf = (req, res) => {
+  const c = db.prepare('SELECT id,owner_id,group_id FROM classes WHERE id=?').get(req.params.id);
+  if (!c || c.owner_id !== req.user.id) { res.status(403).json({ error: 'Only the host can change students\' access.' }); return null; }
+  return c;
+};
+/** Students with their current community access */
+router.get('/:id/access', requireAuth, (req, res) => {
+  const c = hostOf(req, res); if (!c) return;
+  const rows = db.prepare(`SELECT u.id,u.username,u.display_name,u.avatar,m.expires_at,m.role FROM class_enrollments e JOIN users u ON u.id=e.user_id
+    LEFT JOIN group_members m ON m.group_id=? AND m.user_id=u.id WHERE e.class_id=? ORDER BY u.username`).all(c.group_id, c.id);
+  const k = db.prepare('SELECT access_policy,access_grace_days,access_applied FROM classes WHERE id=?').get(c.id);
+  res.json({ policy: k.access_policy, grace_days: k.access_grace_days, applied: !!k.access_applied, students: rows.map(r => ({ ...r, active: r.role === 'owner' || (!!r.role && (!r.expires_at || r.expires_at > new Date().toISOString().slice(0, 19).replace('T', ' '))) })) });
+});
+/** End access now (or after N days) for all students, or one student (user_id) */
+router.post('/:id/access/end', requireAuth, (req, res) => {
+  const c = hostOf(req, res); if (!c) return;
+  const b = req.body || {};
+  const r = access.endAccess(c.id, { graceDays: graceOf({ access_grace_days: b.grace_days }), userId: parseInt(b.user_id, 10) || null, force: !!b.user_id || !!b.force });
+  res.json({ ok: true, ...r });
+});
+/** Extend access by N days for all students, or one student (user_id) */
+router.post('/:id/access/extend', requireAuth, (req, res) => {
+  const c = hostOf(req, res); if (!c) return;
+  const b = req.body || {};
+  const days = parseInt(b.days, 10);
+  if (!(days >= 1 && days <= 3650)) return res.status(400).json({ error: 'Enter the number of days to add (1 to 3650).' });
+  const ids = b.user_id ? [parseInt(b.user_id, 10)] : db.prepare('SELECT user_id FROM class_enrollments WHERE class_id=?').all(c.id).map(x => x.user_id);
+  res.json({ ok: true, ...access.extendAccess(c.group_id, ids, { days }) });
+});
+
+// ---------- Live room ----------
+router.get('/:id/join', requireAuth, (req, res) => {
+  const c = db.prepare('SELECT * FROM classes WHERE id=? AND active=1').get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Class not found.' });
+  const host = c.owner_id === req.user.id;
+  if (!host && !enrolled(c.id, req.user.id)) return res.status(403).json({ error: 'Enrol in this class to join it.' });
+  if (c.kind === 'recorded') return res.status(400).json({ error: 'This is a recorded course - open the lessons.' });
+  if (ownerfees.paymentsOn('class_fee') && db.prepare("SELECT 1 FROM owner_invoices WHERE class_id=? AND kind='class_fee' AND status='due' AND due_at IS NOT NULL").get(c.id) && getSetting('class_fee_when') === 'before_start')
+    return res.status(402).json({ error: host ? 'Pay the class hosting fee to open the room.' : 'The host still has to finish setting up this class. Please try again shortly.', fee_due: host });
+  const start = Date.parse(c.starts_at.replace(' ', 'T') + 'Z');
+  const now = Date.now();
+  if (now < start - 15 * 60000) return res.status(425).json({ error: 'The room opens 15 minutes before the start.', starts_at: c.starts_at });
+  if (now > start + (c.duration_min + 120) * 60000) return res.status(410).json({ error: 'This class has ended.' + (c.replay_url ? ' A replay is available.' : '') });
+  if (c.kind === 'external') return res.json({ type: 'external', url: c.meeting_url });
+  res.json({ type: 'jitsi', domain: getSetting('jitsi_domain') || 'meet.jit.si', room: c.room, name: req.user.display_name || req.user.username, host, subject: c.title });
+});
+
+// ---------- Recorded lessons ----------
+router.get('/:id/lessons', requireAuth, (req, res) => {
+  const c = db.prepare('SELECT owner_id FROM classes WHERE id=?').get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Class not found.' });
+  if (c.owner_id !== req.user.id && !enrolled(req.params.id, req.user.id)) return res.status(403).json({ error: 'Enrol to see the lessons.' });
+  res.json(db.prepare('SELECT * FROM class_lessons WHERE class_id=? ORDER BY position,id').all(req.params.id));
+});
+router.post('/:id/lessons', requireAuth, restrict('class'), uploadMedia.single('media'), async (req, res) => {
+  try {
+    const c = db.prepare('SELECT owner_id FROM classes WHERE id=?').get(req.params.id);
+    if (!c || c.owner_id !== req.user.id) { if (req.file) removeFile(req.file); return res.status(403).json({ error: 'Not allowed.' }); }
+    const title = String((req.body || {}).title || '').trim().slice(0, 120);
+    if (!title) { if (req.file) removeFile(req.file); return res.status(400).json({ error: 'Give the lesson a title.' }); }
+    let media = null;
+    if (req.file) media = (await claimMedia(req.file, req.user.id)).url;
+    const pos = db.prepare('SELECT COALESCE(MAX(position),0)+1 AS p FROM class_lessons WHERE class_id=?').get(req.params.id).p;
+    const info = db.prepare('INSERT INTO class_lessons(class_id,title,content,media,position) VALUES(?,?,?,?,?)').run(req.params.id, title, String((req.body || {}).content || '').slice(0, 8000), media, pos);
+    res.json({ id: info.lastInsertRowid });
+  } catch (e) {
+    if (req.file) removeFile(req.file);
+    res.status(e.status || 400).json({ error: e.message, owner: e.owner });
+  }
+});
+router.delete('/lessons/:lid', requireAuth, (req, res) => {
+  const l = db.prepare('SELECT l.id,c.owner_id FROM class_lessons l JOIN classes c ON c.id=l.class_id WHERE l.id=?').get(req.params.lid);
+  if (!l || l.owner_id !== req.user.id) return res.status(403).json({ error: 'Not allowed.' });
+  db.prepare('DELETE FROM class_lessons WHERE id=?').run(l.id);
+  res.json({ ok: true });
+});
+
+module.exports = router;

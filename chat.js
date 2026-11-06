@@ -1,184 +1,249 @@
-/* Chat (WhatsApp-style): DMs, group chats, replies, reactions, edit/delete, stars, files, voice notes, typing, read receipts, presence */
-(function () {
-  const { esc } = DE;
-  const EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+const express = require('express');
+const { db, bus } = require('../db');
+const { requireAuth, featureOn, restrict } = require('../auth');
+const { isBlocked, hiddenIds } = require('../social');
+const { uploadChat, removeFile } = require('../upload');
+const { mediaKind } = require('../utils');
 
-  function msgHTML(m, conv) {
-    const mine = DE.user && m.sender_id === DE.user.id;
-    if (m.type === 'system') return '<div class="msg sys" data-id="' + m.id + '">' + esc(m.body) + '</div>';
-    let inner = '';
-    if (!mine && conv && conv.type === 'group') inner += '<div class="who">' + esc(m.display_name || m.username) + '</div>';
-    if (m.reply_to) inner += '<div class="quote"><b>@' + esc(m.reply_to.username) + '</b><br>' + esc(String(m.reply_to.body).slice(0, 80)) + '</div>';
-    if (m.deleted) inner += '<i class="muted">🚫 This message was deleted</i>';
-    else {
-      if (m.media) {
-        if (m.type === 'image') inner += '<a href="' + esc(m.media) + '" target="_blank" data-external><img src="' + esc(m.media) + '" alt="Image" loading="lazy"></a>';
-        else if (m.type === 'video') inner += '<video src="' + esc(m.media) + '" controls preload="metadata"></video>';
-        else if (m.type === 'audio' || m.type === 'voice') inner += '<audio src="' + esc(m.media) + '" controls preload="none"></audio>';
-        else inner += '<a href="' + esc(m.media) + '" target="_blank" data-external download>📎 Download file</a>';
-      }
-      if (m.body) inner += '<div style="white-space:pre-wrap">' + esc(m.body) + '</div>';
-    }
-    const react = m.reactions && m.reactions.length ? '<div class="react">' + m.reactions.map(r => '<span>' + esc(r.emoji) + ' ' + r.c + '</span>').join('') + '</div>' : '';
-    const tools = m.deleted ? '' : '<div class="tools"><button data-m="react" title="React">😊</button><button data-m="reply" title="Reply">↩</button><button data-m="star" title="Star">' + (m.starred ? '★' : '☆') + '</button>' +
-      (mine && m.type === 'text' ? '<button data-m="edit" title="Edit">✎</button>' : '') + (mine ? '<button data-m="del" title="Delete for everyone">🗑</button>' : '') + '</div>';
-    return '<div class="msg ' + (mine ? 'me' : '') + '" data-id="' + m.id + '">' + tools + inner + react + '<div class="meta">' + (m.edited ? 'edited · ' : '') + DE.clock(m.created_at) + (mine ? ' <span class="ticks ' + (m.read ? 'read' : '') + '">' + (m.read ? '✓✓' : '✓') + '</span>' : '') + '</div></div>';
+const router = express.Router();
+router.use(featureOn('chat'));
+router.use(requireAuth);
+
+let io = null;
+function setIO(server) { io = server; }
+function emitToConv(convId, event, payload) {
+  if (io) io.to('conv:' + convId).emit(event, payload);
+}
+
+function memberOf(convId, userId) {
+  return db.prepare('SELECT * FROM conversation_members WHERE conversation_id=? AND user_id=?').get(convId, userId);
+}
+
+function shapeMessage(m, viewerId) {
+  const s = db.prepare('SELECT username,display_name,avatar FROM users WHERE id=?').get(m.sender_id) || {};
+  const reactions = db.prepare('SELECT emoji, COUNT(*) c FROM message_reactions WHERE message_id=? GROUP BY emoji').all(m.id);
+  const mine = viewerId ? db.prepare('SELECT emoji FROM message_reactions WHERE message_id=? AND user_id=?').get(m.id, viewerId) : null;
+  const reply = m.reply_to ? db.prepare('SELECT m.id,m.body,m.type,m.deleted,u.username FROM messages m JOIN users u ON u.id=m.sender_id WHERE m.id=?').get(m.reply_to) : null;
+  // read status: seen by everyone else in conversation?
+  const others = db.prepare('SELECT last_read_id FROM conversation_members WHERE conversation_id=? AND user_id!=?').all(m.conversation_id, m.sender_id);
+  const read = others.length > 0 && others.every(o => o.last_read_id >= m.id);
+  const starred = viewerId ? !!db.prepare('SELECT 1 FROM message_stars WHERE message_id=? AND user_id=?').get(m.id, viewerId) : false;
+  return {
+    id: m.id, conversation_id: m.conversation_id, sender_id: m.sender_id, username: s.username, display_name: s.display_name, avatar: s.avatar,
+    type: m.type, body: m.deleted ? '' : m.body, media: m.deleted ? null : m.media, deleted: !!m.deleted, edited: !!m.edited,
+    reply_to: reply ? { id: reply.id, username: reply.username, body: reply.deleted ? 'Message deleted' : (reply.body || '[' + reply.type + ']') } : null,
+    reactions, my_reaction: mine ? mine.emoji : null, read, starred, created_at: m.created_at
+  };
+}
+
+function convSummary(c, userId) {
+  const members = db.prepare(`SELECT u.id,u.username,u.display_name,u.avatar,cm.role FROM conversation_members cm JOIN users u ON u.id=cm.user_id WHERE cm.conversation_id=?`).all(c.id);
+  let title = c.name, avatar = c.avatar;
+  if (c.type === 'dm') {
+    const other = members.find(m => m.id !== userId) || members[0];
+    title = other ? (other.display_name || other.username) : 'Chat';
+    avatar = other ? other.avatar : null;
   }
+  const last = db.prepare('SELECT * FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1').get(c.id);
+  const me = memberOf(c.id, userId);
+  const unread = db.prepare('SELECT COUNT(*) c FROM messages WHERE conversation_id=? AND id>? AND sender_id!=? AND deleted=0').get(c.id, me ? me.last_read_id : 0, userId).c;
+  return {
+    id: c.id, type: c.type, title, avatar, members, unread, muted: me ? !!me.muted : false,
+    last: last ? { body: last.deleted ? 'Message deleted' : (last.body || '[' + last.type + ']'), created_at: last.created_at, mine: last.sender_id === userId } : null,
+    updated: last ? last.created_at : c.created_at
+  };
+}
 
-  function listHTML(list, activeId) {
-    return list.map(c => '<div class="conv ' + (c.id === activeId ? 'on' : '') + '" data-conv="' + c.id + '">' + DE.avatar({ avatar: c.avatar, username: c.title, display_name: c.title }) +
-      '<div class="grow"><div class="row between"><span class="t">' + esc(c.title) + (c.type === 'group' ? ' 👥' : '') + '</span><span class="muted small">' + (c.last ? DE.timeago(c.last.created_at) : '') + '</span></div>' +
-      '<div class="row between"><span class="l">' + (c.last ? (c.last.mine ? 'You: ' : '') + esc(c.last.body) : 'No messages yet') + '</span>' + (c.unread ? '<span class="badge">' + c.unread + '</span>' : '') + '</div></div></div>').join('') || '<div class="empty">No chats yet. Start one with the + button.</div>';
+router.get('/conversations', (req, res) => {
+  const rows = db.prepare(`SELECT c.* FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id WHERE m.user_id=?`).all(req.user.id);
+  const list = rows.map(c => convSummary(c, req.user.id)).sort((a, b) => (b.updated || '').localeCompare(a.updated || ''));
+  res.json(list);
+});
+
+// start (or reuse) a direct chat
+router.post('/dm/:username', restrict('chat'), (req, res) => {
+  const other = db.prepare("SELECT id FROM users WHERE username=? AND status='active'").get(String(req.params.username).toLowerCase());
+  if (!other) return res.status(404).json({ error: 'User not found.' });
+  if (other.id === req.user.id) return res.status(400).json({ error: "You can't message yourself." });
+  if (isBlocked(req.user.id, other.id)) return res.status(403).json({ error: 'You cannot message this user.' });
+  const existing = db.prepare(`SELECT c.id FROM conversations c
+    JOIN conversation_members a ON a.conversation_id=c.id AND a.user_id=?
+    JOIN conversation_members b ON b.conversation_id=c.id AND b.user_id=?
+    WHERE c.type='dm'`).get(req.user.id, other.id);
+  if (existing) return res.json({ id: existing.id });
+  const info = db.prepare("INSERT INTO conversations(type,created_by) VALUES('dm',?)").run(req.user.id);
+  db.prepare('INSERT INTO conversation_members(conversation_id,user_id) VALUES(?,?)').run(info.lastInsertRowid, req.user.id);
+  db.prepare('INSERT INTO conversation_members(conversation_id,user_id) VALUES(?,?)').run(info.lastInsertRowid, other.id);
+  res.json({ id: info.lastInsertRowid });
+});
+
+// create a chat group
+router.post('/groups', restrict('chat'), (req, res) => {
+  const { name, usernames } = req.body || {};
+  if (!name || String(name).trim().length < 1) return res.status(400).json({ error: 'Give the group a name.' });
+  const info = db.prepare("INSERT INTO conversations(type,name,created_by) VALUES('group',?,?)").run(String(name).slice(0, 60), req.user.id);
+  const cid = info.lastInsertRowid;
+  db.prepare("INSERT INTO conversation_members(conversation_id,user_id,role) VALUES(?,?, 'admin')").run(cid, req.user.id);
+  (Array.isArray(usernames) ? usernames : []).slice(0, 256).forEach(un => {
+    const u = db.prepare("SELECT id FROM users WHERE username=? AND status='active'").get(String(un).toLowerCase());
+    if (u && u.id !== req.user.id && !isBlocked(req.user.id, u.id)) db.prepare('INSERT OR IGNORE INTO conversation_members(conversation_id,user_id) VALUES(?,?)').run(cid, u.id);
+  });
+  const sys = db.prepare("INSERT INTO messages(conversation_id,sender_id,type,body) VALUES(?,?, 'system', ?)").run(cid, req.user.id, 'Group created by @' + req.user.username);
+  if (io) db.prepare('SELECT user_id FROM conversation_members WHERE conversation_id=?').all(cid).forEach(m => io.to('user:' + m.user_id).emit('conversation:new', { id: cid }));
+  res.json({ id: cid, first: sys.lastInsertRowid });
+});
+
+router.post('/:id/members', (req, res) => {
+  const me = memberOf(req.params.id, req.user.id);
+  const c = db.prepare('SELECT * FROM conversations WHERE id=?').get(req.params.id);
+  if (!c || c.type !== 'group' || !me || me.role !== 'admin') return res.status(403).json({ error: 'Only group admins can add people.' });
+  const u = db.prepare("SELECT id,username FROM users WHERE username=? AND status='active'").get(String((req.body || {}).username || '').toLowerCase());
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  db.prepare('INSERT OR IGNORE INTO conversation_members(conversation_id,user_id) VALUES(?,?)').run(c.id, u.id);
+  db.prepare("INSERT INTO messages(conversation_id,sender_id,type,body) VALUES(?,?, 'system', ?)").run(c.id, req.user.id, '@' + req.user.username + ' added @' + u.username);
+  if (io) { io.to('user:' + u.id).emit('conversation:new', { id: c.id }); io.to('conv:' + c.id).emit('conversation:update', { id: c.id }); }
+  res.json({ ok: true });
+});
+
+router.post('/:id/members/:uid/remove', (req, res) => {
+  const me = memberOf(req.params.id, req.user.id);
+  const c = db.prepare('SELECT * FROM conversations WHERE id=?').get(req.params.id);
+  if (!c || c.type !== 'group' || !me || me.role !== 'admin') return res.status(403).json({ error: 'Only group admins can remove people.' });
+  db.prepare('DELETE FROM conversation_members WHERE conversation_id=? AND user_id=?').run(c.id, req.params.uid);
+  emitToConv(c.id, 'conversation:update', { id: c.id });
+  res.json({ ok: true });
+});
+
+router.post('/:id/leave', (req, res) => {
+  const c = db.prepare('SELECT * FROM conversations WHERE id=?').get(req.params.id);
+  if (!c || !memberOf(c.id, req.user.id)) return res.status(404).json({ error: 'Chat not found.' });
+  db.prepare('DELETE FROM conversation_members WHERE conversation_id=? AND user_id=?').run(c.id, req.user.id);
+  if (c.type === 'group') {
+    db.prepare("INSERT INTO messages(conversation_id,sender_id,type,body) VALUES(?,?, 'system', ?)").run(c.id, req.user.id, '@' + req.user.username + ' left');
+    const left = db.prepare('SELECT COUNT(*) c FROM conversation_members WHERE conversation_id=?').get(c.id).c;
+    if (!left) db.prepare('DELETE FROM conversations WHERE id=?').run(c.id);
+    else if (!db.prepare("SELECT 1 FROM conversation_members WHERE conversation_id=? AND role='admin'").get(c.id))
+      db.prepare("UPDATE conversation_members SET role='admin' WHERE rowid=(SELECT rowid FROM conversation_members WHERE conversation_id=? LIMIT 1)").run(c.id);
+    emitToConv(c.id, 'conversation:update', { id: c.id });
   }
+  res.json({ ok: true });
+});
 
-  async function render(view, convId) {
-    DE.title('Chat');
-    let convs = await DE.get('/chat/conversations');
-    let active = convId ? convs.find(c => c.id === convId) : null;
-    let replyTo = null, editing = null, typingTimer = null, rec = null, recChunks = [];
-    const typers = {};
+router.post('/:id/mute', (req, res) => {
+  if (!memberOf(req.params.id, req.user.id)) return res.status(404).json({ error: 'Chat not found.' });
+  db.prepare('UPDATE conversation_members SET muted=? WHERE conversation_id=? AND user_id=?').run((req.body || {}).muted ? 1 : 0, req.params.id, req.user.id);
+  res.json({ ok: true });
+});
 
-    view.innerHTML = '<div class="chatwrap ' + (convId ? 'inconv' : '') + '" id="cw"><div class="convlist"><div class="row between" style="padding:10px"><b>Chats</b><div class="row"><button class="icon-btn" id="newDm" title="New chat">＋</button><button class="icon-btn" id="newGrp" title="New group">👥</button><button class="icon-btn" id="starred" title="Starred messages">★</button></div></div>' +
-      '<div style="padding:0 10px 8px"><input class="i" id="msearch" placeholder="Search messages..."></div><div id="convs">' + listHTML(convs, convId) + '</div></div>' +
-      '<div class="chatpane" id="pane">' + (active ? '' : '<div class="empty" style="margin:auto">Select a chat or start a new one 💬</div>') + '</div></div>';
+router.get('/:id/messages', (req, res) => {
+  const me = memberOf(req.params.id, req.user.id);
+  if (!me) return res.status(403).json({ error: 'Not your chat.' });
+  const before = parseInt(req.query.before, 10) || 9e15;
+  const hide = new Set(hiddenIds(req.user.id));
+  const rows = db.prepare('SELECT * FROM messages WHERE conversation_id=? AND id<? ORDER BY id DESC LIMIT 50').all(req.params.id, before).reverse().filter(m => !hide.has(m.sender_id));
+  res.json(rows.map(m => shapeMessage(m, req.user.id)));
+});
 
-    const $ = s => DE.$(s, view);
-    const convsEl = $('#convs');
-    function refreshList() { return DE.get('/chat/conversations').then(l => { convs = l; convsEl.innerHTML = listHTML(convs, convId); }); }
-    convsEl.onclick = e => { const c = e.target.closest('[data-conv]'); if (c) DE.navigate('/chat/' + c.dataset.conv); };
-
-    $('#newDm').onclick = () => DE.modal('<h2>New chat</h2><input class="i" id="uq" placeholder="Search by username or name"><div id="ures"></div>', m => {
-      let t; m.querySelector('#uq').oninput = e => { clearTimeout(t); t = setTimeout(async () => {
-        const r = await DE.get('/users/search?q=' + encodeURIComponent(e.target.value)).catch(() => ({ users: [] }));
-        m.querySelector('#ures').innerHTML = r.users.filter(u => u.id !== DE.user.id).map(u => '<div class="row" style="padding:6px 0;cursor:pointer" data-u="' + esc(u.username) + '">' + DE.avatar(u, 'sm') + '<span>' + esc(u.display_name || u.username) + ' <span class="muted small">@' + esc(u.username) + '</span></span></div>').join('') || '<p class="muted">No users found (type at least 3 letters).</p>';
-      }, 300); };
-      m.onclick = async e => { const r = e.target.closest('[data-u]'); if (r) { const d = await DE.post('/chat/dm/' + r.dataset.u); DE.$('#modalRoot').innerHTML = ''; DE.navigate('/chat/' + d.id); } };
-    });
-    $('#newGrp').onclick = () => DE.modal('<h2>New group chat</h2><label class="f">Group name</label><input class="i" id="gname" maxlength="60"><label class="f">Add people (usernames, comma separated)</label><input class="i" id="gusers" placeholder="chisom, ada, tunde"><div class="err" id="gerr"></div><div class="row" style="margin-top:12px"><button class="btn primary" id="gok">Create group</button><button class="btn" data-close>Cancel</button></div>', (m, close) => {
-      m.querySelector('#gok').onclick = async () => { try { const r = await DE.post('/chat/groups', { name: m.querySelector('#gname').value, usernames: m.querySelector('#gusers').value.split(',').map(s => s.trim().replace(/^@/, '')).filter(Boolean) }); close(); DE.navigate('/chat/' + r.id); } catch (ex) { m.querySelector('#gerr').textContent = ex.message; } };
-    });
-    $('#starred').onclick = async () => { const l = await DE.get('/chat/starred-all'); DE.modal('<h2>Starred messages</h2>' + (l.map(m => '<div class="card flat" style="margin:6px 0"><b>@' + esc(m.username) + '</b> <span class="muted small">' + DE.timeago(m.created_at) + '</span><div>' + esc(m.body || '[' + m.type + ']') + '</div></div>').join('') || '<p class="muted">No starred messages.</p>') + '<button class="btn" data-close>Close</button>'); };
-    let st; $('#msearch').oninput = e => { clearTimeout(st); st = setTimeout(async () => {
-      const q = e.target.value.trim(); if (q.length < 4) { convsEl.innerHTML = listHTML(convs, convId); return; }
-      const r = await DE.get('/chat/messages-search?q=' + encodeURIComponent(q)).catch(() => []);
-      convsEl.innerHTML = r.map(x => '<div class="conv" data-conv="' + x.conversation_id + '"><div class="grow"><div class="l">' + esc(x.body.slice(0, 80)) + '</div><div class="muted small">' + DE.timeago(x.created_at) + '</div></div></div>').join('') || '<div class="empty">No matches.</div>';
-    }, 350); };
-
-    if (!active) return;
-    const pane = $('#pane');
-    const isGroup = active.type === 'group';
-    const other = !isGroup ? active.members.find(m => m.id !== DE.user.id) : null;
-    pane.innerHTML = '<div class="chathead"><button class="icon-btn" id="back">←</button>' + DE.avatar({ avatar: active.avatar, username: active.title, display_name: active.title }, 'sm') +
-      '<div class="grow"><b>' + esc(active.title) + '</b><div class="muted small" id="sub">' + (isGroup ? active.members.length + ' members' : '') + '</div></div>' +
-      '<button class="icon-btn" id="muteB" title="Mute">' + (active.muted ? '🔕' : '🔔') + '</button>' + (isGroup ? '<button class="icon-btn" id="info" title="Group info">ℹ</button>' : '') + '</div>' +
-      '<div class="msgs" id="msgs"></div><div class="typing" id="typing"></div><div id="replybar"></div>' +
-      '<form class="composer" id="cf"><label class="icon-btn" title="Attach file" style="cursor:pointer">📎<input type="file" id="cfile" hidden></label><textarea id="ctext" rows="1" placeholder="Type a message"></textarea><button type="button" class="icon-btn" id="mic" title="Voice note">🎤</button><button class="btn primary" id="send">Send</button></form>';
-    $('#back').onclick = () => DE.navigate('/chat');
-    const msgsEl = $('#msgs');
-
-    const messages = await DE.get('/chat/' + convId + '/messages');
-    const byId = {}; messages.forEach(m => (byId[m.id] = m));
-    msgsEl.innerHTML = messages.map(m => msgHTML(m, active)).join('');
-    msgsEl.scrollTop = msgsEl.scrollHeight;
-    const markRead = () => DE.post('/chat/' + convId + '/read').then(refreshList).catch(() => {});
-    markRead();
-    DE.get('/chat/conversations').then(() => {});
-    if (DE.socket && other) DE.socket.emit('presence:query', [other.id], r => { const s = $('#sub'); if (s) s.textContent = r[other.id] ? 'online' : 'offline'; });
-
-    function put(m) {
-      byId[m.id] = m;
-      const old = msgsEl.querySelector('[data-id="' + m.id + '"]');
-      const tmp = document.createElement('div'); tmp.innerHTML = msgHTML(m, active);
-      if (old) old.replaceWith(tmp.firstChild);
-      else { const near = msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight < 160; msgsEl.appendChild(tmp.firstChild); if (near || m.sender_id === DE.user.id) msgsEl.scrollTop = msgsEl.scrollHeight; }
-    }
-
-    // ---- realtime ----
-    const sock = DE.socket;
-    const on = {
-      'message:new': m => { if (m.conversation_id !== convId) return; put(m); if (m.sender_id !== DE.user.id) markRead(); },
-      'message:update': m => { if (m.conversation_id === convId) put(m); },
-      'conversation:read': d => { if (d.conversation_id === convId && d.user_id !== DE.user.id) DE.$$('.msg.me .ticks', msgsEl).forEach(t => { t.classList.add('read'); t.textContent = '✓✓'; }); },
-      'typing': d => {
-        if (d.conversation_id !== convId) return;
-        if (d.typing) typers[d.user_id] = d.username; else delete typers[d.user_id];
-        const names = Object.values(typers); const t = $('#typing'); if (t) t.textContent = names.length ? names.join(', ') + ' typing...' : '';
-      },
-      'presence': d => { if (other && d.user_id === other.id) { const s = $('#sub'); if (s) s.textContent = d.online ? 'online' : 'offline'; } },
-      'conversation:update': d => { if (d.id === convId) DE.render(); }
-    };
-    if (sock) { Object.entries(on).forEach(([e, f]) => sock.on(e, f)); sock.emit('conversation:join', convId); }
-    DE.cleanup = () => { if (sock) Object.entries(on).forEach(([e, f]) => sock.off(e, f)); if (rec && rec.state === 'recording') rec.stop(); };
-
-    // ---- sending ----
-    const ctext = $('#ctext');
-    ctext.addEventListener('input', () => {
-      ctext.style.height = 'auto'; ctext.style.height = Math.min(120, ctext.scrollHeight) + 'px';
-      if (sock) { sock.emit('typing', { conversation_id: convId, typing: true }); clearTimeout(typingTimer); typingTimer = setTimeout(() => sock.emit('typing', { conversation_id: convId, typing: false }), 1800); }
-    });
-    ctext.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 800) { e.preventDefault(); $('#cf').requestSubmit(); } });
-    function setReply(m) { replyTo = m; const rb = $('#replybar'); rb.innerHTML = m ? '<div class="replybar"><span>Replying to <b>@' + esc(m.username) + '</b>: ' + esc((m.body || '[' + m.type + ']').slice(0, 60)) + '</span><button class="icon-btn" id="cr">✕</button></div>' : ''; if (m) $('#cr').onclick = () => setReply(null); }
-    async function sendFile(file, voice) {
-      const fd = new FormData(); fd.append('media', file); if (voice) fd.append('voice', '1'); if (replyTo) fd.append('reply_to', replyTo.id); fd.append('body', ctext.value);
-      ctext.value = ''; setReply(null);
-      try { await DE.post('/chat/' + convId + '/messages', fd); } catch (ex) { DE.fail(ex); }
-    }
-    $('#cfile').onchange = e => { if (e.target.files[0]) sendFile(e.target.files[0]); e.target.value = ''; };
-    $('#cf').onsubmit = async e => {
-      e.preventDefault();
-      const body = ctext.value.trim(); if (!body) return;
-      try {
-        if (editing) { await DE.put('/chat/messages/' + editing.id, { body }); editing = null; $('#send').textContent = 'Send'; }
-        else await DE.post('/chat/' + convId + '/messages', { body, reply_to: replyTo ? replyTo.id : null });
-        ctext.value = ''; ctext.style.height = 'auto'; setReply(null);
-        if (sock) sock.emit('typing', { conversation_id: convId, typing: false });
-      } catch (ex) { DE.fail(ex); }
-    };
-
-    // voice notes
-    $('#mic').onclick = async () => {
-      const mic = $('#mic');
-      if (rec && rec.state === 'recording') { rec.stop(); return; }
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        recChunks = []; rec = new MediaRecorder(stream);
-        rec.ondataavailable = e => recChunks.push(e.data);
-        rec.onstop = () => { stream.getTracks().forEach(t => t.stop()); mic.textContent = '🎤'; const type = rec.mimeType || 'audio/webm'; const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm'; sendFile(new File(recChunks, 'voice-note.' + ext, { type: type.split(';')[0] }), true); };
-        rec.start(); mic.textContent = '⏹';
-        DE.toast('Recording... tap again to send');
-      } catch (e) { DE.toast('Microphone permission is needed for voice notes.', true); }
-    };
-
-    // message actions
-    msgsEl.onclick = async e => {
-      const b = e.target.closest('[data-m]'); if (!b) return;
-      const el = b.closest('.msg'); const m = byId[el.dataset.id]; const act = b.dataset.m;
-      try {
-        if (act === 'reply') { setReply(m); ctext.focus(); }
-        else if (act === 'star') { await DE.post('/chat/messages/' + m.id + '/star'); m.starred = !m.starred; put(m); }
-        else if (act === 'del') { if (await DE.confirm('Delete this message for everyone?', 'Delete')) await DE.del('/chat/messages/' + m.id); }
-        else if (act === 'edit') { editing = m; ctext.value = m.body; ctext.focus(); $('#send').textContent = 'Save'; }
-        else if (act === 'react') {
-          DE.modal('<div class="row wrap" style="justify-content:center;font-size:1.8rem">' + EMOJIS.map(x => '<button class="icon-btn" style="font-size:1.8rem" data-e="' + x + '">' + x + '</button>').join('') + '</div>', (mm, close) => {
-            DE.$$('[data-e]', mm).forEach(x => x.onclick = async () => { close(); await DE.post('/chat/messages/' + m.id + '/react', { emoji: x.dataset.e }); });
-          });
-        }
-      } catch (ex) { DE.fail(ex); }
-    };
-
-    $('#muteB').onclick = async () => { active.muted = !active.muted; await DE.post('/chat/' + convId + '/mute', { muted: active.muted }); $('#muteB').textContent = active.muted ? '🔕' : '🔔'; };
-    const info = $('#info');
-    if (info) info.onclick = () => {
-      const admin = active.members.find(m => m.id === DE.user.id && m.role === 'admin');
-      DE.modal('<h2>' + esc(active.title) + '</h2>' + active.members.map(m => '<div class="row" style="padding:5px 0">' + DE.avatar(m, 'sm') + '<span class="grow">' + esc(m.display_name || m.username) + (m.role === 'admin' ? ' <span class="tag">admin</span>' : '') + '</span>' + (admin && m.id !== DE.user.id ? '<button class="btn sm danger" data-rm="' + m.id + '">Remove</button>' : '') + '</div>').join('') +
-        (admin ? '<div class="row" style="margin-top:10px"><input class="i" id="addu" placeholder="Add username"><button class="btn" id="addb">Add</button></div>' : '') + '<div class="row" style="margin-top:12px"><button class="btn danger" id="leave">Leave group</button><button class="btn" data-close>Close</button></div>', (m, close) => {
-        DE.$$('[data-rm]', m).forEach(b => b.onclick = async () => { await DE.post('/chat/' + convId + '/members/' + b.dataset.rm + '/remove'); close(); });
-        const ab = m.querySelector('#addb'); if (ab) ab.onclick = async () => { try { await DE.post('/chat/' + convId + '/members', { username: m.querySelector('#addu').value.replace(/^@/, '') }); close(); } catch (ex) { DE.fail(ex); } };
-        m.querySelector('#leave').onclick = async () => { await DE.post('/chat/' + convId + '/leave'); close(); DE.navigate('/chat'); };
-      });
-    };
+function sendMessage(convId, user, { type, body, media, reply_to }) {
+  const info = db.prepare('INSERT INTO messages(conversation_id,sender_id,type,body,media,reply_to) VALUES(?,?,?,?,?,?)')
+    .run(convId, user.id, type || 'text', body || '', media || null, reply_to || null);
+  db.prepare('UPDATE conversation_members SET last_read_id=? WHERE conversation_id=? AND user_id=?').run(info.lastInsertRowid, convId, user.id);
+  const msg = shapeMessage(db.prepare('SELECT * FROM messages WHERE id=?').get(info.lastInsertRowid), user.id);
+  if (io) {
+    io.to('conv:' + convId).emit('message:new', msg);
+    const members = db.prepare('SELECT user_id,muted FROM conversation_members WHERE conversation_id=?').all(convId);
+    members.forEach(m => io.to('user:' + m.user_id).emit('conversation:bump', { id: convId, muted: !!m.muted, from: user.username }));
+    const hide = new Set(hiddenIds(user.id));
+    bus.emit('chat', { convId, sender: user, msg, recipients: members.filter(m => !m.muted && m.user_id !== user.id && !hide.has(m.user_id)).map(m => m.user_id) });
   }
+  return msg;
+}
 
-  DE.route('/chat', (view) => render(view, null), { auth: true });
-  DE.route('/chat/:id', (view, p) => render(view, parseInt(p.id, 10)), { auth: true });
-})();
+router.post('/:id/messages', restrict('chat'), uploadChat.single('media'), (req, res) => {
+  try {
+    if (!memberOf(req.params.id, req.user.id)) { if (req.file) removeFile(req.file); return res.status(403).json({ error: 'Not your chat.' }); }
+    const conv = db.prepare('SELECT type FROM conversations WHERE id=?').get(req.params.id);
+    if (conv && conv.type === 'dm') {
+      const other = db.prepare('SELECT user_id FROM conversation_members WHERE conversation_id=? AND user_id!=?').get(req.params.id, req.user.id);
+      if (other && isBlocked(req.user.id, other.user_id)) { if (req.file) removeFile(req.file); return res.status(403).json({ error: 'You cannot message this user.' }); }
+    }
+    const body = String((req.body || {}).body || '').slice(0, 4000);
+    const reply_to = parseInt((req.body || {}).reply_to, 10) || null;
+    if (!req.file && !body.trim()) return res.status(400).json({ error: 'Message is empty.' });
+    let type = 'text', media = null;
+    if (req.file) {
+      type = mediaKind(req.file.mimetype);
+      if (type === 'audio' && req.body.voice === '1') type = 'voice';
+      media = '/uploads/' + req.file.filename;
+    }
+    res.json(sendMessage(parseInt(req.params.id, 10), req.user, { type, body, media, reply_to }));
+  } catch (e) {
+    if (req.file) removeFile(req.file);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+router.put('/messages/:mid', (req, res) => {
+  const m = db.prepare('SELECT * FROM messages WHERE id=?').get(req.params.mid);
+  if (!m || m.sender_id !== req.user.id || m.deleted || m.type !== 'text') return res.status(403).json({ error: 'You can only edit your own text messages.' });
+  db.prepare('UPDATE messages SET body=?, edited=1 WHERE id=?').run(String((req.body || {}).body || '').slice(0, 4000), m.id);
+  const msg = shapeMessage(db.prepare('SELECT * FROM messages WHERE id=?').get(m.id), req.user.id);
+  emitToConv(m.conversation_id, 'message:update', msg);
+  res.json(msg);
+});
+
+// delete for everyone
+router.delete('/messages/:mid', (req, res) => {
+  const m = db.prepare('SELECT * FROM messages WHERE id=?').get(req.params.mid);
+  if (!m) return res.status(404).json({ error: 'Message not found.' });
+  const me = memberOf(m.conversation_id, req.user.id);
+  if (!me || (m.sender_id !== req.user.id && me.role !== 'admin')) return res.status(403).json({ error: 'Not allowed.' });
+  db.prepare("UPDATE messages SET deleted=1, body='', media=NULL WHERE id=?").run(m.id);
+  emitToConv(m.conversation_id, 'message:update', shapeMessage(db.prepare('SELECT * FROM messages WHERE id=?').get(m.id), req.user.id));
+  res.json({ ok: true });
+});
+
+router.post('/messages/:mid/react', (req, res) => {
+  const m = db.prepare('SELECT * FROM messages WHERE id=?').get(req.params.mid);
+  if (!m || !memberOf(m.conversation_id, req.user.id)) return res.status(403).json({ error: 'Not allowed.' });
+  const emoji = String((req.body || {}).emoji || '').slice(0, 8);
+  const cur = db.prepare('SELECT emoji FROM message_reactions WHERE message_id=? AND user_id=?').get(m.id, req.user.id);
+  if (!emoji || (cur && cur.emoji === emoji)) db.prepare('DELETE FROM message_reactions WHERE message_id=? AND user_id=?').run(m.id, req.user.id);
+  else db.prepare('INSERT INTO message_reactions(message_id,user_id,emoji) VALUES(?,?,?) ON CONFLICT(message_id,user_id) DO UPDATE SET emoji=excluded.emoji').run(m.id, req.user.id, emoji);
+  emitToConv(m.conversation_id, 'message:update', shapeMessage(db.prepare('SELECT * FROM messages WHERE id=?').get(m.id), req.user.id));
+  res.json({ ok: true });
+});
+
+router.post('/messages/:mid/star', (req, res) => {
+  const m = db.prepare('SELECT * FROM messages WHERE id=?').get(req.params.mid);
+  if (!m || !memberOf(m.conversation_id, req.user.id)) return res.status(403).json({ error: 'Not allowed.' });
+  const had = db.prepare('SELECT 1 FROM message_stars WHERE message_id=? AND user_id=?').get(m.id, req.user.id);
+  if (had) db.prepare('DELETE FROM message_stars WHERE message_id=? AND user_id=?').run(m.id, req.user.id);
+  else db.prepare('INSERT INTO message_stars(message_id,user_id) VALUES(?,?)').run(m.id, req.user.id);
+  res.json({ starred: !had });
+});
+
+router.post('/:id/read', (req, res) => {
+  if (!memberOf(req.params.id, req.user.id)) return res.status(403).json({ error: 'Not your chat.' });
+  const last = db.prepare('SELECT MAX(id) m FROM messages WHERE conversation_id=?').get(req.params.id).m || 0;
+  db.prepare('UPDATE conversation_members SET last_read_id=? WHERE conversation_id=? AND user_id=?').run(last, req.params.id, req.user.id);
+  emitToConv(parseInt(req.params.id, 10), 'conversation:read', { conversation_id: parseInt(req.params.id, 10), user_id: req.user.id, last_read_id: last });
+  res.json({ ok: true });
+});
+
+router.get('/messages-search', (req, res) => {
+  const q = '%' + String(req.query.q || '').replace(/[%_]/g, '') + '%';
+  if (q.length < 4) return res.json([]);
+  res.json(db.prepare(`SELECT m.id,m.conversation_id,m.body,m.created_at FROM messages m JOIN conversation_members cm ON cm.conversation_id=m.conversation_id AND cm.user_id=?
+    WHERE m.deleted=0 AND m.body LIKE ? ORDER BY m.id DESC LIMIT 30`).all(req.user.id, q));
+});
+
+router.get('/starred-all', (req, res) => {
+  const rows = db.prepare('SELECT m.* FROM messages m JOIN message_stars s ON s.message_id=m.id WHERE s.user_id=? ORDER BY m.id DESC LIMIT 100').all(req.user.id);
+  res.json(rows.map(m => shapeMessage(m, req.user.id)));
+});
+
+module.exports = router;
+module.exports.setIO = setIO;
+module.exports.memberOf = memberOf;
+module.exports.sendMessage = sendMessage;
