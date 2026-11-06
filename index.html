@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#07130f">
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<link rel="icon" href="/icons/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<!--SEO_HEAD-->
+<link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+<div id="announce" class="announce" hidden></div>
+<header class="topbar" id="topbar">
+  <a href="/" class="brand" aria-label="Digital Enviro home"><img src="/logo.svg" alt="" width="34" height="34"><span>Digital <b>Enviro</b></span></a>
+  <form id="searchForm" class="search" role="search"><input id="searchInput" type="search" placeholder="Search people, pages, groups, products..." aria-label="Search" autocomplete="off"></form>
+  <nav class="topnav" id="topnav" aria-label="Main"></nav>
+</header>
+<div class="shell">
+  <aside class="side" id="side" aria-label="Sections"></aside>
+  <main id="view" class="view" tabindex="-1">
+    <noscript><!--SEO_BODY--><p>Please enable JavaScript to use Digital Enviro.</p></noscript>
+    <div class="seo-fallback"><!--SEO_BODY--></div>
+  </main>
+  <aside class="rail" id="rail" aria-label="Suggestions"></aside>
+</div>
+<nav class="tabbar" id="tabbar" aria-label="Mobile"></nav>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="modalRoot"></div>
+<script src="/socket.io/socket.io.js" defer></script>
+<script src="/js/core.js" defer></script>
+<script src="/js/components.js" defer></script>
+<script src="/js/views/auth.js" defer></script>
+<script src="/js/views/feed.js" defer></script>
+<script src="/js/views/profile.js" defer></script>
+<script src="/js/views/pages.js" defer></script>
+<script src="/js/views/groups.js" defer></script>
+<script src="/js/views/market.js" defer></script>
+<script src="/js/views/wallet.js" defer></script>
+<script src="/js/views/chat.js" defer></script>
+<script src="/js/views/misc.js" defer></script>
+<script src="/js/views/classes.js" defer></script>
+<script src="/js/views/reels.js" defer></script>
+<script src="/js/views/creator.js" defer></script>
+<script src="/js/views/dropship.js" defer></script>
+<script src="/js/app.js" defer></script>
+</body>
+</html>

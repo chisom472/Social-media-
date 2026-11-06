@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="t">
+  <title id="t">Digital Enviro logo</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f2a22"/>
+      <stop offset="1" stop-color="#07130f"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#1fbf80"/>
+      <stop offset="1" stop-color="#8bf0b8"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded hexagon badge -->
+  <path d="M256 22 456 137v238L256 490 56 375V137Z" fill="url(#bg)" stroke="#2fd89a" stroke-width="10" stroke-linejoin="round"/>
+  <!-- leaf -->
+  <path d="M256 400C168 372 132 292 150 214c10-44 46-84 106-110 60 26 96 66 106 110 18 78-18 158-106 186Z" fill="url(#leaf)"/>
+  <!-- circuit traces (the leaf veins) -->
+  <g fill="none" stroke="#07130f" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M256 392V176"/>
+    <path d="M256 330 206 290V248"/>
+    <path d="M256 290 308 250V216"/>
+    <path d="M256 236 214 204"/>
+  </g>
+  <g fill="#07130f">
+    <circle cx="256" cy="168" r="17"/>
+    <circle cx="206" cy="240" r="15"/>
+    <circle cx="308" cy="208" r="15"/>
+    <circle cx="210" cy="200" r="12"/>
+  </g>
+  <g fill="#ffb454">
+    <circle cx="256" cy="168" r="8"/>
+    <circle cx="206" cy="240" r="6.5"/>
+    <circle cx="308" cy="208" r="6.5"/>
+  </g>
+  <!-- stem -->
+  <path d="M256 392v34" stroke="#2fd89a" stroke-width="12" stroke-linecap="round"/>
+</svg>
